@@ -4,12 +4,143 @@ generator client {
 
 datasource db {
   provider  = "postgresql"
-  url       = env("DATABASE_URL")          // pooled — runtime queries
-  directUrl = env("DIRECT_DATABASE_URL")   // direct — migrations
+  url       = env("DATABASE_URL") // pooled — runtime queries
+  directUrl = env("DIRECT_DATABASE_URL") // direct — migrations
 }
 
-// Temporary bootstrap model just to test migrations
 model Bootstrap {
   id        Int      @id @default(autoincrement())
   createdAt DateTime @default(now())
+}
+
+model User {
+  id           Int            @id @default(autoincrement())
+  email        String         @unique
+  passwordHash String
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+  tokens       RefreshToken[]
+  senderName   String?        @db.VarChar(11) // προεπιλεγμένος SMS sender (αλφαριθμητικό 3-11)
+  company      String?        @db.VarChar(160)
+  Campaign     Campaign[]
+}
+
+model RefreshToken {
+  id        Int       @id @default(autoincrement())
+  token     String    @unique
+  userId    Int
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  revokedAt DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+model Contact {
+  id        Int      @id @default(autoincrement())
+  phone     String
+  email     String?  @db.VarChar(320)
+  firstName String?  @db.VarChar(120)
+  lastName  String?  @db.VarChar(120)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  memberships ListMembership[]
+  messages    CampaignMessage[] // back-relation to CampaignMessage
+
+  @@unique([phone])
+}
+
+model List {
+  id          Int      @id @default(autoincrement())
+  name        String   @db.VarChar(160)
+  description String?  @db.VarChar(400)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  memberships ListMembership[]
+  campaigns   Campaign[] // back-relation to Campaign
+
+  @@unique([name])
+}
+
+model ListMembership {
+  id        Int      @id @default(autoincrement())
+  listId    Int
+  contactId Int
+  createdAt DateTime @default(now())
+
+  list    List    @relation(fields: [listId], references: [id], onDelete: Cascade)
+  contact Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  @@unique([listId, contactId])
+  @@index([contactId])
+  @@index([listId])
+}
+
+enum CampaignStatus {
+  draft
+  scheduled
+  sending
+  paused
+  completed
+  failed
+}
+
+model MessageTemplate {
+  id        Int      @id @default(autoincrement())
+  name      String   @unique
+  text      String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  campaigns Campaign[] // back-relation to Campaign
+}
+
+model Campaign {
+  id          Int             @id @default(autoincrement())
+  name        String
+  templateId  Int
+  template    MessageTemplate @relation(fields: [templateId], references: [id], onDelete: Restrict)
+  listId      Int
+  list        List            @relation(fields: [listId], references: [id], onDelete: Restrict)
+  status      CampaignStatus  @default(draft)
+  scheduledAt DateTime?
+  startedAt   DateTime?
+  finishedAt  DateTime?
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+  total       Int             @default(0)
+  sent        Int             @default(0)
+  failed      Int             @default(0)
+  createdById Int
+  createdBy   User            @relation(fields: [createdById], references: [id], onDelete: Restrict)
+
+  messages CampaignMessage[]
+
+  @@index([status])
+  @@index([scheduledAt])
+}
+
+model CampaignMessage {
+  id                Int       @id @default(autoincrement())
+  campaignId        Int
+  campaign          Campaign  @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  contactId         Int
+  contact           Contact   @relation(fields: [contactId], references: [id], onDelete: Cascade)
+  to                String
+  status            String    @default("queued") // queued|sent|failed
+  text              String    @default("") @db.Text
+  providerMessageId String?
+  error             String?
+  createdAt         DateTime  @default(now())
+  sentAt            DateTime?
+  deliveredAt       DateTime?
+  failedAt          DateTime?
+
+  @@index([campaignId])
+  @@index([contactId])
+  @@index([status])
+  @@index([providerMessageId])
 }

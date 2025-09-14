@@ -30,5 +30,31 @@ app.use(healthRoutes);
 // default
 app.get('/', (_req, res) => res.json({ status: 'api-ok' }));
 
+const cookieParser = require('cookie-parser');
+const authRoutes = require('./routes/auth');
+const requireAuth = require('./middleware/requireAuth');
+app.use(cookieParser());
+app.use(authRoutes);
+app.get('/me', requireAuth, (req,res)=> res.json({ user: req.user }));
+
+const contactsRoutes = require('./routes/contacts');
+const listsRoutes = require('./routes/lists');
+app.use(contactsRoutes);
+app.use(listsRoutes);
+
+const templatesRoutes = require('./routes/templates');
+const campaignsRoutes = require('./routes/campaigns');
+app.use(templatesRoutes);
+app.use(campaignsRoutes);
+
+const mittoRoutes = require('./routes/mitto');
+app.use(mittoRoutes);
+
+const mittoWebhookRoutes = require('./routes/mitto.webhooks');
+app.use(mittoWebhookRoutes);
+
+
 const port = process.env.PORT || 3001;
 app.listen(port, () => logger.info(`API running on http://localhost:${port}`));
+
+

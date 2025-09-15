@@ -14,15 +14,27 @@ model Bootstrap {
 }
 
 model User {
-  id           Int            @id @default(autoincrement())
-  email        String         @unique
+  id           Int      @id @default(autoincrement())
+  email        String   @unique
   passwordHash String
-  createdAt    DateTime       @default(now())
-  updatedAt    DateTime       @updatedAt
-  tokens       RefreshToken[]
-  senderName   String?        @db.VarChar(11) // προεπιλεγμένος SMS sender (αλφαριθμητικό 3-11)
-  company      String?        @db.VarChar(160)
-  Campaign     Campaign[]
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  // Auth tokens
+  tokens RefreshToken[]
+
+  // Optional profile
+  senderName String? @db.VarChar(11) // default SMS sender (3-11 alphanumeric)
+  company    String? @db.VarChar(160)
+
+  // Back-relations (named where needed)
+  ownedCampaigns   Campaign[]        @relation("CampaignOwner")
+  createdCampaigns Campaign[]        @relation("CampaignCreator")
+  contacts         Contact[]
+  lists            List[]
+  templates        MessageTemplate[]
+  messages         CampaignMessage[]
+  redemptions      Redemption[]
 }
 
 model RefreshToken {
@@ -38,7 +50,12 @@ model RefreshToken {
 }
 
 model Contact {
-  id        Int      @id @default(autoincrement())
+  id Int @id @default(autoincrement())
+
+  // OWNER SCOPE
+  ownerId Int
+  owner   User @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
   phone     String
   email     String?  @db.VarChar(320)
   firstName String?  @db.VarChar(120)
@@ -46,23 +63,36 @@ model Contact {
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  memberships ListMembership[]
-  messages    CampaignMessage[] // back-relation to CampaignMessage
+  // subscription state
+  isSubscribed         Boolean   @default(true)
+  unsubscribeTokenHash String?   @db.VarChar(64)
+  unsubscribedAt       DateTime?
 
-  @@unique([phone])
+  memberships ListMembership[]
+  messages    CampaignMessage[]
+
+  @@unique([ownerId, phone]) // unique per owner
+  @@index([unsubscribeTokenHash])
+  @@index([ownerId])
 }
 
 model List {
-  id          Int      @id @default(autoincrement())
+  id Int @id @default(autoincrement())
+
+  // OWNER SCOPE
+  ownerId Int
+  owner   User @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
   name        String   @db.VarChar(160)
   description String?  @db.VarChar(400)
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
   memberships ListMembership[]
-  campaigns   Campaign[] // back-relation to Campaign
+  campaigns   Campaign[]
 
-  @@unique([name])
+  @@unique([ownerId, name]) // unique per owner
+  @@index([ownerId])
 }
 
 model ListMembership {
@@ -89,49 +119,84 @@ enum CampaignStatus {
 }
 
 model MessageTemplate {
-  id        Int      @id @default(autoincrement())
-  name      String   @unique
+  id Int @id @default(autoincrement())
+
+  // OWNER SCOPE
+  ownerId Int
+  owner   User @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  name      String
   text      String
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
-  campaigns Campaign[] // back-relation to Campaign
+  campaigns Campaign[]
+
+  @@unique([ownerId, name]) // template names unique per owner
+  @@index([ownerId])
 }
 
 model Campaign {
-  id          Int             @id @default(autoincrement())
-  name        String
-  templateId  Int
-  template    MessageTemplate @relation(fields: [templateId], references: [id], onDelete: Restrict)
-  listId      Int
-  list        List            @relation(fields: [listId], references: [id], onDelete: Restrict)
-  status      CampaignStatus  @default(draft)
+  id Int @id @default(autoincrement())
+
+  // OWNER SCOPE
+  ownerId Int
+  owner   User @relation(name: "CampaignOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+
+  name       String
+  templateId Int
+  template   MessageTemplate @relation(fields: [templateId], references: [id], onDelete: Restrict)
+  listId     Int
+  list       List            @relation(fields: [listId], references: [id], onDelete: Restrict)
+
+  status      CampaignStatus @default(draft)
   scheduledAt DateTime?
   startedAt   DateTime?
   finishedAt  DateTime?
-  createdAt   DateTime        @default(now())
-  updatedAt   DateTime        @updatedAt
-  total       Int             @default(0)
-  sent        Int             @default(0)
-  failed      Int             @default(0)
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+  total       Int            @default(0)
+  sent        Int            @default(0)
+  failed      Int            @default(0)
+
   createdById Int
-  createdBy   User            @relation(fields: [createdById], references: [id], onDelete: Restrict)
+  createdBy   User @relation(name: "CampaignCreator", fields: [createdById], references: [id], onDelete: Restrict)
 
   messages CampaignMessage[]
 
   @@index([status])
   @@index([scheduledAt])
+  @@index([createdAt])
+  @@index([ownerId])
+}
+
+enum MessageStatus {
+  queued
+  sent
+  delivered
+  failed
 }
 
 model CampaignMessage {
-  id                Int       @id @default(autoincrement())
-  campaignId        Int
-  campaign          Campaign  @relation(fields: [campaignId], references: [id], onDelete: Cascade)
-  contactId         Int
-  contact           Contact   @relation(fields: [contactId], references: [id], onDelete: Cascade)
-  to                String
-  status            String    @default("queued") // queued|sent|failed
-  text              String    @default("") @db.Text
+  id Int @id @default(autoincrement())
+
+  // OWNER SCOPE
+  ownerId Int
+  owner   User @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  campaignId Int
+  campaign   Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  contactId Int
+  contact   Contact @relation(fields: [contactId], references: [id], onDelete: Cascade)
+
+  to   String
+  text String @default("") @db.Text
+
+  trackingId String @unique // unique QR/link id per message
+
+  status MessageStatus @default(queued)
+
   providerMessageId String?
   error             String?
   createdAt         DateTime  @default(now())
@@ -139,8 +204,43 @@ model CampaignMessage {
   deliveredAt       DateTime?
   failedAt          DateTime?
 
+  redemption Redemption?
+
   @@index([campaignId])
   @@index([contactId])
   @@index([status])
+  @@index([providerMessageId])
+  @@index([ownerId])
+}
+
+model Redemption {
+  messageId Int             @id
+  message   CampaignMessage @relation(fields: [messageId], references: [id])
+
+  campaignId Int
+  contactId  Int
+
+  // OWNER SCOPE
+  ownerId Int
+  owner   User @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+
+  redeemedAt       DateTime @default(now())
+  redeemedByUserId Int?
+  evidenceJson     Json?
+
+  @@index([campaignId])
+  @@index([contactId])
+  @@index([ownerId])
+}
+
+model WebhookEvent {
+  id                Int      @id @default(autoincrement())
+  provider          String
+  eventType         String
+  receivedAt        DateTime @default(now())
+  payload           Json
+  providerMessageId String?
+
+  @@index([provider, eventType])
   @@index([providerMessageId])
 }

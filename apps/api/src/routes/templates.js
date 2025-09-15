@@ -4,56 +4,61 @@ const requireAuth = require('../middleware/requireAuth');
 
 const router = express.Router();
 
-// Create template
-router.post('/templates', requireAuth, async (req, res) => {
-  try {
-    const { name, text } = req.body || {};
-    if (!name || !text) return res.status(400).json({ message: 'name & text required' });
-    const t = await prisma.messageTemplate.create({ data: { name, text } });
-    res.status(201).json(t);
-  } catch (e) {
-    if (e.code === 'P2002') return res.status(409).json({ message: 'name already exists' });
-    res.status(400).json({ message: e.message });
-  }
+const SYSTEM_USER_ID = Number(process.env.SYSTEM_USER_ID || 1);
+
+/**
+ * NOTE:
+ * - Templates are managed by the platform (system user).
+ * - Owners can only read & use them in campaigns.
+ * - No create/update/delete endpoints for normal users.
+ */
+
+// List templates (system-only), with optional search & pagination
+router.get('/templates', requireAuth, async (req, res) => {
+  const page = Math.max(1, parseInt(req.query.page || '1', 10));
+  const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize || '50', 10)));
+  const q = (req.query.q || '').toString().trim();
+
+  const where = { ownerId: SYSTEM_USER_ID };
+  if (q) where.name = { contains: q, mode: 'insensitive' };
+
+  const [items, total] = await Promise.all([
+    prisma.messageTemplate.findMany({
+      where,
+      orderBy: { id: 'desc' },
+      skip: (page - 1) * pageSize,
+      take: pageSize,
+      select: { id: true, name: true, text: true, createdAt: true, updatedAt: true }
+    }),
+    prisma.messageTemplate.count({ where })
+  ]);
+
+  res.json({ items, total, page, pageSize });
 });
 
-// List templates
-router.get('/templates', requireAuth, async (_req, res) => {
-  const items = await prisma.messageTemplate.findMany({ orderBy: { id: 'desc' } });
-  res.json(items);
-});
-
-// Get one
+// Get one template (system-only)
 router.get('/templates/:id', requireAuth, async (req, res) => {
   const id = Number(req.params.id);
-  const t = await prisma.messageTemplate.findUnique({ where: { id } });
+  if (!id) return res.status(400).json({ message: 'invalid id' });
+
+  const t = await prisma.messageTemplate.findFirst({
+    where: { id, ownerId: SYSTEM_USER_ID },
+    select: { id: true, name: true, text: true, createdAt: true, updatedAt: true }
+  });
   if (!t) return res.status(404).json({ message: 'not found' });
+
   res.json(t);
 });
 
-// Update
-router.put('/templates/:id', requireAuth, async (req, res) => {
-  try {
-    const id = Number(req.params.id);
-    const { name, text } = req.body || {};
-    const t = await prisma.messageTemplate.update({ where: { id }, data: { name, text } });
-    res.json(t);
-  } catch (e) {
-    if (e.code === 'P2025') return res.status(404).json({ message: 'not found' });
-    if (e.code === 'P2002') return res.status(409).json({ message: 'name already exists' });
-    res.status(400).json({ message: e.message });
-  }
+// Explicitly block write operations for non-admin users
+router.post('/templates', requireAuth, (_req, res) => {
+  return res.status(403).json({ message: 'Templates are managed by the platform.' });
 });
-
-// Delete
-router.delete('/templates/:id', requireAuth, async (req, res) => {
-  try {
-    await prisma.messageTemplate.delete({ where: { id: Number(req.params.id) } });
-    res.json({ ok: true });
-  } catch (e) {
-    if (e.code === 'P2025') return res.status(404).json({ message: 'not found' });
-    res.status(400).json({ message: e.message });
-  }
+router.put('/templates/:id', requireAuth, (_req, res) => {
+  return res.status(403).json({ message: 'Templates are managed by the platform.' });
+});
+router.delete('/templates/:id', requireAuth, (_req, res) => {
+  return res.status(403).json({ message: 'Templates are managed by the platform.' });
 });
 
 module.exports = router;

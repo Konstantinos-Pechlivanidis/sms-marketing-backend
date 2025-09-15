@@ -22,7 +22,11 @@ const corsOptions = allowlist.length
 
 app.use(helmet());
 app.use(cors(corsOptions));
-app.use(express.json());
+
+// keep a raw copy for HMAC verification
+app.use(express.json({
+  verify: (req, res, buf) => { req.rawBody = buf; }
+}));
 
 // routes
 app.use(healthRoutes);
@@ -53,6 +57,17 @@ app.use(mittoRoutes);
 const mittoWebhookRoutes = require('./routes/mitto.webhooks');
 app.use(mittoWebhookRoutes);
 
+const jobsRoutes = require('./routes/jobs');
+app.use(jobsRoutes);
+
+const trackingRoutes = require('./routes/tracking');
+app.use('/tracking', trackingRoutes);
+
+const campaignStatsRoutes = require('./routes/campaigns.stats');
+app.use('/api/v1', campaignStatsRoutes);
+
+const campaignsListRoutes = require('./routes/campaigns.list');
+app.use('/api/v1', campaignsListRoutes);
 
 const port = process.env.PORT || 3001;
 app.listen(port, () => logger.info(`API running on http://localhost:${port}`));

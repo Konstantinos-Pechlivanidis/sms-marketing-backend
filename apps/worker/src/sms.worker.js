@@ -1,19 +1,20 @@
-// apps/worker/src/sms.worker.js
-require('dotenv').config();
+const crypto = require('node:crypto'); // add
 
-if (process.env.QUEUE_DISABLED === '1') {
-  console.warn('[Worker] Disabled via QUEUE_DISABLED=1');
-  process.exit(0);
+function sha256Hex(s) {
+  return crypto.createHash('sha256').update(s).digest('hex');
 }
-
-const { Worker } = require('bullmq');
-const IORedis = require('ioredis');
-const prisma = require('../../api/src/lib/prisma');
-const { sendSingle } = require('../../api/src/services/mitto.service');
-
-const url = process.env.REDIS_URL || 'redis://localhost:6379';
-const connection = new IORedis(url, { maxRetriesPerRequest: null });
-connection.on('error', (e) => console.warn('[Redis] connection error:', e.message));
+function newUnsubToken() {
+  return crypto.randomBytes(24).toString('base64url');
+}
+async function ensureFreshUnsubToken(contactId) {
+  const token = newUnsubToken();
+  const tokenHash = sha256Hex(token);
+  await prisma.contact.update({
+    where: { id: contactId },
+    data: { unsubscribeTokenHash: tokenHash }
+  });
+  return token; // plain για το SMS link
+}
 
 const worker = new Worker(
   'smsQueue',
@@ -22,43 +23,44 @@ const worker = new Worker(
 
     const msg = await prisma.campaignMessage.findUnique({
       where: { id: messageId },
-      include: { campaign: { select: { createdById: true } } }
+      include: { campaign: { select: { createdById: true } }, contact: true }
     });
     if (!msg) return;
+
+    // Build links
+    const redeemUrl = `${process.env.APP_PUBLIC_BASE_URL}/scan/${msg.trackingId}`;
+    const unsubToken = await ensureFreshUnsubToken(msg.contact.id);
+    const unsubUrl  = `${process.env.APP_PUBLIC_BASE_URL}/u/${unsubToken}`;
+
+    // Final SMS text
+    const text = `${(msg.text || 'Special offer!').trim()}\n` +
+                 `Redeem: ${redeemUrl}\n` +
+                 `Unsub: ${unsubUrl}`;
 
     try {
       const resp = await sendSingle({
         userId: msg.campaign.createdById,
         destination: msg.to,
-        text: msg.text
+        text
       });
-
-      // Single-send: συνήθως έρχεται ως { messageId: "..." }
-      // Bulk: messages[0].messageId — καλύπτουμε και τις 2 περιπτώσεις.
       const providerId = resp?.messageId || resp?.messages?.[0]?.messageId || null;
 
       await prisma.campaignMessage.update({
         where: { id: msg.id },
-        data: {
-          providerMessageId: providerId,
-          sentAt: new Date(),
-          status: 'sent'
-        }
+        data: { providerMessageId: providerId, sentAt: new Date(), status: 'sent' }
       });
     } catch (e) {
+      const retryable = isRetryable(e);
       await prisma.campaignMessage.update({
         where: { id: msg.id },
         data: {
-          failedAt: new Date(),
-          status: 'failed',
+          failedAt: retryable ? null : new Date(),
+          status: retryable ? 'queued' : 'failed',
           error: e.message
         }
       });
-      throw e; // επιτρέπει retry από BullMQ (όταν το ενεργοποιήσουμε)
+      if (retryable) throw e;
     }
   },
-  { connection }
+  { connection, concurrency }
 );
-
-worker.on('completed', (job) => console.log(`Job ${job.id} completed`));
-worker.on('failed', (job, err) => console.error(`Job ${job.id} failed:`, err));

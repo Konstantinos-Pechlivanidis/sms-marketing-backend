@@ -1,81 +1,145 @@
 const express = require('express');
 const prisma = require('../lib/prisma');
 const pino = require('pino');
+const crypto = require('node:crypto');
 
 const router = express.Router();
 const logger = pino({ transport: { target: 'pino-pretty' } });
 
-// Απλός έλεγχος shared secret
-function verifySecret(req, res, next) {
-  const expected = process.env.WEBHOOK_SECRET;
-  const got = req.header('X-Webhook-Token');
-  if (!expected) return res.status(500).json({ message: 'Webhook secret not configured' });
-  if (got !== expected) return res.status(401).json({ message: 'Unauthorized webhook' });
-  next();
+/** Dev + Prod verification
+ * - Dev: ?secret=WEBHOOK_SECRET  OR  header X-Webhook-Token: WEBHOOK_SECRET
+ * - Prod: HMAC(SHA256, WEBHOOK_SECRET) over req.rawBody in header X-Webhook-Signature
+ */
+function verifyWebhook(req) {
+  const shared = process.env.WEBHOOK_SECRET;
+  if (!shared) return false;
+
+  // Dev conveniences
+  if (req.query?.secret && req.query.secret === shared) return true;
+  const token = req.header('X-Webhook-Token');
+  if (token && token === shared) return true;
+
+  // Prod HMAC
+  const sig = req.header('X-Webhook-Signature');
+  if (!sig || !req.rawBody) return false;
+  const mac = crypto.createHmac('sha256', shared).update(req.rawBody).digest('hex');
+  try {
+    return crypto.timingSafeEqual(Buffer.from(sig, 'utf8'), Buffer.from(mac, 'utf8'));
+  } catch {
+    return false;
+  }
 }
 
 // Χάρτης status από Mitto → δικά μας πεδία
 function mapStatus(s) {
   const v = String(s || '').toLowerCase();
-  if (['delivered', 'completed', 'ok'].includes(v)) return 'delivered';
-  if (['failed', 'undelivered', 'error'].includes(v)) return 'failed';
-  if (['queued', 'accepted', 'sent', 'submitted'].includes(v)) return 'sent';
+  if (['delivered', 'delivrd', 'completed', 'ok'].includes(v)) return 'delivered';
+  if (['failed', 'undelivered', 'expired', 'rejected', 'error'].includes(v)) return 'failed';
+  if (['queued', 'accepted', 'submitted', 'enroute', 'sent'].includes(v)) return 'sent';
   return 'unknown';
 }
 
-/**
- * Υποστηρίζουμε 2 σχήματα payload:
- *  A) Ενιαίο αντικείμενο: { messageId, status, error, timestamp, destination }
- *  B) Λίστα αντικειμένων: [ { ... }, { ... } ]
- *  Το messageId της Mitto αντιστοιχεί στο δικό μας providerMessageId.
- */
-router.post('/webhooks/mitto/dlr', verifySecret, async (req, res) => {
-  const body = req.body;
-  const events = Array.isArray(body) ? body : [body];
+// --- Delivery Status (DLR) ---
+router.post('/webhooks/mitto/dlr', async (req, res) => {
+  try {
+    if (!verifyWebhook(req)) return res.status(401).json({ ok: false });
 
-  let updated = 0;
-  for (const ev of events) {
-    const providerId = ev?.messageId || ev?.id || ev?.MessageId;
-    const statusIn = ev?.status || ev?.Status;
-    const error = ev?.error || ev?.Error || null;
-    const ts = ev?.timestamp || ev?.Timestamp || new Date().toISOString();
+    const body = req.body;
+    const events = Array.isArray(body) ? body : [body];
 
-    if (!providerId) {
-      logger.warn({ ev }, 'DLR without messageId — ignoring');
-      continue;
-    }
+    let updated = 0;
+    for (const ev of events) {
+      // ευελιξία στα πεδία του provider
+      const providerId = ev?.messageId || ev?.id || ev?.MessageId;
+      const statusIn = ev?.status || ev?.Status;
+      const doneAt   = ev?.doneAt || ev?.timestamp || ev?.Timestamp || new Date().toISOString();
+      const errorCode = ev?.errorCode || ev?.err || null;
+      const errorDesc = ev?.error || ev?.Error || ev?.description || null;
 
-    const mapped = mapStatus(statusIn);
-
-    try {
-      if (mapped === 'delivered') {
-        const r = await prisma.campaignMessage.updateMany({
-          where: { providerMessageId: providerId },
-          data: { deliveredAt: new Date(ts), status: 'sent' } // κρατάμε status 'sent', αλλά σημειώνουμε deliveredAt
-        });
-        updated += r.count;
-      } else if (mapped === 'failed') {
-        const r = await prisma.campaignMessage.updateMany({
-          where: { providerMessageId: providerId },
-          data: { failedAt: new Date(ts), status: 'failed', error: error || 'FAILED_DLR' }
-        });
-        updated += r.count;
-      } else if (mapped === 'sent') {
-        // προαιρετική ενημέρωση sentAt αν έρθει
-        await prisma.campaignMessage.updateMany({
-          where: { providerMessageId: providerId },
-          data: { sentAt: new Date(ts) }
-        });
-      } else {
-        logger.info({ providerId, ev }, 'DLR unknown status');
+      if (!providerId) {
+        logger.warn({ ev }, 'DLR without messageId — ignoring');
+        continue;
       }
-    } catch (e) {
-      logger.error({ err: e, ev }, 'DLR update error');
-    }
-  }
 
-  // Δεν σταματάμε το webhook για unmatched events — τα δεχόμαστε (202)
-  res.status(202).json({ ok: true, updated });
+      const mapped = mapStatus(statusIn);
+
+      try {
+        if (mapped === 'delivered') {
+          const r = await prisma.campaignMessage.updateMany({
+            where: { providerMessageId: providerId },
+            data: { status: 'delivered', deliveredAt: new Date(doneAt) }
+          });
+          updated += r.count;
+        } else if (mapped === 'failed') {
+          const r = await prisma.campaignMessage.updateMany({
+            where: { providerMessageId: providerId },
+            data: {
+              status: 'failed',
+              failedAt: new Date(doneAt),
+              error: errorDesc || 'FAILED_DLR'
+            }
+          });
+          updated += r.count;
+        } else if (mapped === 'sent') {
+          await prisma.campaignMessage.updateMany({
+            where: { providerMessageId: providerId },
+            data: { status: 'sent', sentAt: new Date(doneAt) }
+          });
+        } else {
+          logger.info({ providerId, statusIn }, 'DLR unknown status');
+        }
+      } catch (e) {
+        logger.error({ err: e, providerId, statusIn }, 'DLR update error');
+      }
+    }
+
+    // πάντα 200/202 για να μην μας κάνει retry storm ο provider
+    return res.status(202).json({ ok: true, updated });
+  } catch (e) {
+    logger.error({ err: e }, 'DLR handler error');
+    return res.status(200).json({ ok: true });
+  }
+});
+
+// --- Inbound MO (STOP) ---
+function normalizeMsisdn(s) {
+  if (!s) return null;
+  let v = String(s).trim();
+  // πολύ απλό normalize: αν ξεκινά με '00' → '+'
+  if (v.startsWith('00')) v = '+' + v.slice(2);
+  // αν δεν ξεκινά με '+' και μοιάζει με ελληνικό κινητό (10ψήφιο), προπρόσθεσε +30 (προσαρμόσ’ το στις χώρες σου)
+  if (!v.startsWith('+') && /^\d{10,15}$/.test(v)) v = '+30' + v;
+  return v;
+}
+
+router.post('/webhooks/mitto/inbound', async (req, res) => {
+  try {
+    if (!verifyWebhook(req)) return res.status(401).json({ ok: false });
+
+    const body = req.body;
+    const from = body.from || body.msisdn || body.sender;
+    const text = (body.text || body.message || '').toString();
+    if (!from || !text) return res.status(202).json({ ok: true });
+
+    const phone = normalizeMsisdn(from);
+
+    // STOP detection (ξερός έλεγχος, μπορείς να βάλεις και STOPALL κλπ.)
+    if (/^\s*stop\b/i.test(text)) {
+      const r = await prisma.contact.updateMany({
+        where: { phone, isSubscribed: true },
+        data: { isSubscribed: false, unsubscribedAt: new Date() }
+      });
+      logger.info({ phone, count: r.count }, 'Inbound STOP → unsubscribed');
+    }
+
+    // προαιρετικά: αποθήκευση για audit/dedup (WebhookEvent)
+    // await prisma.webhookEvent.create({ data: { provider:'mitto', eventType:'inbound', payload: body } });
+
+    return res.status(202).json({ ok: true });
+  } catch (e) {
+    logger.error({ err: e }, 'Inbound handler error');
+    return res.status(200).json({ ok: true });
+  }
 });
 
 module.exports = router;

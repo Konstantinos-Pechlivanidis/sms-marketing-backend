@@ -1,0 +1,1 @@
+exports.scoped = (ownerId) => ({ ownerId });

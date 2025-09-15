@@ -1,14 +1,20 @@
+// apps/api/src/routes/mitto.webhooks.js
 const express = require('express');
 const prisma = require('../lib/prisma');
 const pino = require('pino');
 const crypto = require('node:crypto');
+const { cacheDel } = require('../lib/cache'); // safe no-op if Redis disabled
 
 const router = express.Router();
 const logger = pino({ transport: { target: 'pino-pretty' } });
 
-/** Dev + Prod verification
+/**
+ * Dev + Prod verification
  * - Dev: ?secret=WEBHOOK_SECRET  OR  header X-Webhook-Token: WEBHOOK_SECRET
  * - Prod: HMAC(SHA256, WEBHOOK_SECRET) over req.rawBody in header X-Webhook-Signature
+ *
+ * Ensure you have express.json({ verify: (req, _res, buf) => { req.rawBody = buf } })
+ * in your server setup so rawBody is available.
  */
 function verifyWebhook(req) {
   const shared = process.env.WEBHOOK_SECRET;
@@ -30,7 +36,7 @@ function verifyWebhook(req) {
   }
 }
 
-// Χάρτης status από Mitto → δικά μας πεδία
+// Map Mitto-like status → our internal buckets
 function mapStatus(s) {
   const v = String(s || '').toLowerCase();
   if (['delivered', 'delivrd', 'completed', 'ok'].includes(v)) return 'delivered';
@@ -39,7 +45,29 @@ function mapStatus(s) {
   return 'unknown';
 }
 
-// --- Delivery Status (DLR) ---
+/**
+ * Persist a raw webhook for auditing/replay/dedup later.
+ * Never blocks the request even if it fails.
+ */
+async function persistWebhook(provider, eventType, payload, providerMessageId) {
+  try {
+    await prisma.webhookEvent.create({
+      data: {
+        provider,
+        eventType,
+        payload,
+        providerMessageId: providerMessageId || null
+      }
+    });
+  } catch (e) {
+    logger.warn({ err: e?.message }, 'WebhookEvent persist failed');
+  }
+}
+
+/**
+ * --- Delivery Status (DLR) ---
+ * Accepts single object or array of objects. Always 202 to avoid retry storms.
+ */
 router.post('/webhooks/mitto/dlr', async (req, res) => {
   try {
     if (!verifyWebhook(req)) return res.status(401).json({ ok: false });
@@ -48,13 +76,16 @@ router.post('/webhooks/mitto/dlr', async (req, res) => {
     const events = Array.isArray(body) ? body : [body];
 
     let updated = 0;
+
     for (const ev of events) {
-      // ευελιξία στα πεδία του provider
-      const providerId = ev?.messageId || ev?.id || ev?.MessageId;
-      const statusIn = ev?.status || ev?.Status;
-      const doneAt   = ev?.doneAt || ev?.timestamp || ev?.Timestamp || new Date().toISOString();
-      const errorCode = ev?.errorCode || ev?.err || null;
-      const errorDesc = ev?.error || ev?.Error || ev?.description || null;
+      // Flexible field extraction (Mitto or similar providers)
+      const providerId = ev?.messageId || ev?.id || ev?.MessageId || null;
+      const statusIn   = ev?.status || ev?.Status || null;
+      const doneAt     = ev?.doneAt || ev?.timestamp || ev?.Timestamp || new Date().toISOString();
+      const errorDesc  = ev?.error || ev?.Error || ev?.description || null;
+
+      // Persist raw webhook (best-effort)
+      await persistWebhook('mitto', 'dlr', ev, providerId);
 
       if (!providerId) {
         logger.warn({ ev }, 'DLR without messageId — ignoring');
@@ -64,6 +95,17 @@ router.post('/webhooks/mitto/dlr', async (req, res) => {
       const mapped = mapStatus(statusIn);
 
       try {
+        // We need affected messages to invalidate per-campaign cache
+        const msgs = await prisma.campaignMessage.findMany({
+          where: { providerMessageId: providerId },
+          select: { id: true, campaignId: true, ownerId: true }
+        });
+
+        if (msgs.length === 0) {
+          logger.info({ providerId }, 'DLR: no local messages matched');
+          continue;
+        }
+
         if (mapped === 'delivered') {
           const r = await prisma.campaignMessage.updateMany({
             where: { providerMessageId: providerId },
@@ -86,14 +128,20 @@ router.post('/webhooks/mitto/dlr', async (req, res) => {
             data: { status: 'sent', sentAt: new Date(doneAt) }
           });
         } else {
-          logger.info({ providerId, statusIn }, 'DLR unknown status');
+          logger.info({ providerId, statusIn }, 'DLR unknown/ignored status');
+        }
+
+        // Cache invalidation for each affected campaign (owner-scoped key)
+        for (const m of msgs) {
+          const key = `stats:campaign:v1:${m.ownerId}:${m.campaignId}`;
+          try { await cacheDel(key); } catch (_) {}
         }
       } catch (e) {
         logger.error({ err: e, providerId, statusIn }, 'DLR update error');
       }
     }
 
-    // πάντα 200/202 για να μην μας κάνει retry storm ο provider
+    // Always accept to prevent provider retries
     return res.status(202).json({ ok: true, updated });
   } catch (e) {
     logger.error({ err: e }, 'DLR handler error');
@@ -101,14 +149,15 @@ router.post('/webhooks/mitto/dlr', async (req, res) => {
   }
 });
 
-// --- Inbound MO (STOP) ---
+/**
+ * --- Inbound MO (STOP) ---
+ * Unsubscribes contact on STOP. Always 202.
+ */
 function normalizeMsisdn(s) {
   if (!s) return null;
   let v = String(s).trim();
-  // πολύ απλό normalize: αν ξεκινά με '00' → '+'
   if (v.startsWith('00')) v = '+' + v.slice(2);
-  // αν δεν ξεκινά με '+' και μοιάζει με ελληνικό κινητό (10ψήφιο), προπρόσθεσε +30 (προσαρμόσ’ το στις χώρες σου)
-  if (!v.startsWith('+') && /^\d{10,15}$/.test(v)) v = '+30' + v;
+  if (!v.startsWith('+') && /^\d{10,15}$/.test(v)) v = '+30' + v; // adjust default country as needed
   return v;
 }
 
@@ -119,11 +168,15 @@ router.post('/webhooks/mitto/inbound', async (req, res) => {
     const body = req.body;
     const from = body.from || body.msisdn || body.sender;
     const text = (body.text || body.message || '').toString();
+
+    // Persist inbound for audit (best-effort)
+    await persistWebhook('mitto', 'inbound', body, null);
+
     if (!from || !text) return res.status(202).json({ ok: true });
 
     const phone = normalizeMsisdn(from);
 
-    // STOP detection (ξερός έλεγχος, μπορείς να βάλεις και STOPALL κλπ.)
+    // Simple STOP detection (extend with STOPALL etc. if needed)
     if (/^\s*stop\b/i.test(text)) {
       const r = await prisma.contact.updateMany({
         where: { phone, isSubscribed: true },
@@ -131,9 +184,6 @@ router.post('/webhooks/mitto/inbound', async (req, res) => {
       });
       logger.info({ phone, count: r.count }, 'Inbound STOP → unsubscribed');
     }
-
-    // προαιρετικά: αποθήκευση για audit/dedup (WebhookEvent)
-    // await prisma.webhookEvent.create({ data: { provider:'mitto', eventType:'inbound', payload: body } });
 
     return res.status(202).json({ ok: true });
   } catch (e) {

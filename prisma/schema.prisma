@@ -28,13 +28,16 @@ model User {
   company    String? @db.VarChar(160)
 
   // Back-relations (named where needed)
-  ownedCampaigns   Campaign[]        @relation("CampaignOwner")
-  createdCampaigns Campaign[]        @relation("CampaignCreator")
-  contacts         Contact[]
-  lists            List[]
-  templates        MessageTemplate[]
-  messages         CampaignMessage[]
-  redemptions      Redemption[]
+  ownedCampaigns    Campaign[]          @relation("CampaignOwner")
+  createdCampaigns  Campaign[]          @relation("CampaignCreator")
+  contacts          Contact[]
+  lists             List[]
+  templates         MessageTemplate[]
+  messages          CampaignMessage[]
+  redemptions       Redemption[]
+  Wallet            Wallet?
+  CreditTransaction CreditTransaction[]
+  Purchase          Purchase[]
 }
 
 model RefreshToken {
@@ -243,4 +246,73 @@ model WebhookEvent {
 
   @@index([provider, eventType])
   @@index([providerMessageId])
+}
+
+enum PaymentStatus {
+  pending
+  paid
+  failed
+  refunded
+}
+
+enum CreditTxnType {
+  credit // e.g. admin topup, purchase
+  debit // e.g. campaign enqueue
+  refund // e.g. immediate provider hard-fail
+}
+
+model Wallet {
+  id        Int      @id @default(autoincrement())
+  ownerId   Int      @unique
+  owner     User     @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  balance   Int      @default(0) // credits balance
+  updatedAt DateTime @updatedAt
+
+  transactions CreditTransaction[]
+}
+
+model CreditTransaction {
+  id           Int           @id @default(autoincrement())
+  ownerId      Int
+  owner        User          @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  type         CreditTxnType
+  amount       Int // positive integer (credits)
+  balanceAfter Int // snapshot of wallet balance after this txn
+  reason       String?       @db.VarChar(200)
+  campaignId   Int?
+  messageId    Int?
+  meta         Json?
+  createdAt    DateTime      @default(now())
+  Wallet       Wallet?       @relation(fields: [walletId], references: [id])
+  walletId     Int?
+
+  @@index([ownerId])
+  @@index([campaignId])
+  @@index([messageId])
+}
+
+model Package {
+  id         Int        @id @default(autoincrement())
+  name       String     @unique
+  units      Int // credits included
+  priceCents Int // price in cents (for reference)
+  active     Boolean    @default(true)
+  createdAt  DateTime   @default(now())
+  updatedAt  DateTime   @updatedAt
+  Purchase   Purchase[]
+}
+
+model Purchase {
+  id         Int           @id @default(autoincrement())
+  ownerId    Int
+  owner      User          @relation(fields: [ownerId], references: [id], onDelete: Cascade)
+  packageId  Int
+  package    Package       @relation(fields: [packageId], references: [id], onDelete: Restrict)
+  units      Int
+  priceCents Int
+  status     PaymentStatus @default(paid) // MVP: treat as paid
+  createdAt  DateTime      @default(now())
+
+  @@index([ownerId])
+  @@index([packageId])
 }

@@ -1,30 +1,33 @@
+// apps/api/src/routes/campaigns.js
 const express = require("express");
 const prisma = require("../lib/prisma");
 const requireAuth = require("../middleware/requireAuth");
-const smsQueue = require("../queues/sms.queue");
-const { scoped } = require("../lib/policies");
+const schedulerQueue = require("../queues/scheduler.queue");
+const { enqueueCampaign } = require("../services/campaignEnqueue.service");
 
 const router = express.Router();
 
-const crypto = require("node:crypto");
-function newTrackingId() {
-  // Short, URL-safe, unique enough for per-message tracking
-  return crypto.randomBytes(9).toString("base64url"); // ~12 chars
-}
+const SYSTEM_USER_ID = Number(process.env.SYSTEM_USER_ID || 1);
 
-// Simple placeholder rendering: {{firstName}} {{lastName}} {{email}}
+// Minimal placeholder rendering for preview
 function render(templateText, contact) {
   return (templateText || "")
     .replace(/{{\s*firstName\s*}}/gi, contact.firstName || "")
     .replace(/{{\s*lastName\s*}}/gi, contact.lastName || "")
     .replace(/{{\s*email\s*}}/gi, contact.email || "");
 }
+function msUntil(dateStr) {
+  const when = new Date(dateStr).getTime();
+  const now = Date.now();
+  return Math.max(0, when - now);
+}
 
 /* =========================================================
  * POST /campaigns (protected)
- * Create a draft campaign scoped to the authenticated owner.
- * - Validates ownership of template & list.
- * - Pre-computes total recipients (subscribed only).
+ * Create a campaign (draft or scheduled).
+ * - Validates ownership of template (owner or system) & list (owner).
+ * - Pre-computes total = subscribed members count at creation time.
+ * - If scheduledAt provided -> status 'scheduled' + delayed job.
  * ========================================================= */
 router.post("/campaigns", requireAuth, async (req, res) => {
   try {
@@ -35,45 +38,51 @@ router.post("/campaigns", requireAuth, async (req, res) => {
         .json({ message: "name, templateId, listId required" });
     }
 
-    // Validate ownership of template & list
-    const SYSTEM_USER_ID = Number(process.env.SYSTEM_USER_ID || 1);
-
+    // Validate template (system or owner) & list ownership
     const [tpl, lst] = await Promise.all([
       prisma.messageTemplate.findFirst({
         where: {
           id: Number(templateId),
-          ownerId: { in: [req.user.id, SYSTEM_USER_ID] }, // << allow system templates
+          ownerId: { in: [req.user.id, SYSTEM_USER_ID] },
         },
       }),
       prisma.list.findFirst({
         where: { id: Number(listId), ownerId: req.user.id },
       }),
     ]);
+    if (!tpl) return res.status(404).json({ message: "template not found" });
+    if (!lst) return res.status(404).json({ message: "list not found" });
 
-    if (!tpl || !lst)
-      return res.status(404).json({ message: "template or list not found" });
-
-    // Count subscribed members for this list (MVP: only isSubscribed == true)
+    // Count subscribed members now (informational)
     const total = await prisma.listMembership.count({
-      where: {
-        listId: Number(listId),
-        contact: { isSubscribed: true },
-      },
+      where: { listId: Number(listId), contact: { isSubscribed: true } },
     });
+
+    const initialStatus = scheduledAt ? "scheduled" : "draft";
 
     const campaign = await prisma.campaign.create({
       data: {
-        ownerId: req.user.id, // << SCOPE
+        ownerId: req.user.id,
         name,
         templateId: Number(templateId),
         listId: Number(listId),
-        status: "draft",
+        status: initialStatus,
         scheduledAt: scheduledAt ? new Date(scheduledAt) : null,
         createdById: req.user.id,
         total,
       },
       include: { template: true, list: true },
     });
+
+    // If scheduled -> add delayed scheduler job
+    if (campaign.status === "scheduled" && schedulerQueue) {
+      const delay = msUntil(campaign.scheduledAt);
+      await schedulerQueue.add(
+        "enqueueCampaign",
+        { campaignId: campaign.id },
+        { jobId: `campaign:schedule:${campaign.id}`, delay }
+      );
+    }
 
     res.status(201).json(campaign);
   } catch (e) {
@@ -83,7 +92,7 @@ router.post("/campaigns", requireAuth, async (req, res) => {
 
 /* =========================================================
  * GET /campaigns (protected)
- * Paginated list of campaigns for the owner.
+ * Paginated list of campaigns (scoped).
  * Query: take (<=100), skip
  * ========================================================= */
 router.get("/campaigns", requireAuth, async (req, res) => {
@@ -92,13 +101,13 @@ router.get("/campaigns", requireAuth, async (req, res) => {
 
   const [items, total] = await Promise.all([
     prisma.campaign.findMany({
-      where: { ...scoped(req.user.id) }, // << SCOPE
+      where: { ownerId: req.user.id },
       take,
       skip,
       orderBy: { id: "desc" },
       include: { template: true, list: true },
     }),
-    prisma.campaign.count({ where: { ...scoped(req.user.id) } }), // << SCOPE
+    prisma.campaign.count({ where: { ownerId: req.user.id } }),
   ]);
 
   res.json({ items, total, skip, take });
@@ -113,29 +122,29 @@ router.get("/campaigns/:id", requireAuth, async (req, res) => {
   if (!id) return res.status(400).json({ message: "invalid id" });
 
   const c = await prisma.campaign.findFirst({
-    where: { id, ownerId: req.user.id }, // << SCOPE
+    where: { id, ownerId: req.user.id },
     include: { template: true, list: true },
   });
-
   if (!c) return res.status(404).json({ message: "not found" });
+
   res.json(c);
 });
 
 /* =========================================================
  * GET /campaigns/:id/preview (protected)
- * First 10 rendered messages for a campaign (for preview).
+ * Return first 10 rendered messages for preview (scoped).
+ * Only for subscribed contacts at the time of preview.
  * ========================================================= */
 router.get("/campaigns/:id/preview", requireAuth, async (req, res) => {
   const id = Number(req.params.id);
   if (!id) return res.status(400).json({ message: "invalid id" });
 
   const c = await prisma.campaign.findFirst({
-    where: { id, ownerId: req.user.id }, // << SCOPE
+    where: { id, ownerId: req.user.id },
     include: { template: true },
   });
   if (!c) return res.status(404).json({ message: "not found" });
 
-  // Members of the list that are subscribed (preview respects final audience)
   const members = await prisma.listMembership.findMany({
     where: { listId: c.listId, contact: { isSubscribed: true } },
     include: { contact: true },
@@ -152,112 +161,126 @@ router.get("/campaigns/:id/preview", requireAuth, async (req, res) => {
 
 /* =========================================================
  * POST /campaigns/:id/enqueue (protected)
- * Create per-contact CampaignMessage for subscribed contacts,
- * set status -> sending, enqueue background jobs (idempotent).
+ * Manual enqueue using service (idempotent, scoped).
  * ========================================================= */
 router.post("/campaigns/:id/enqueue", requireAuth, async (req, res) => {
   const id = Number(req.params.id);
   if (!id) return res.status(400).json({ message: "invalid id" });
 
-  // Fetch owned campaign + template
-  const campaign = await prisma.campaign.findFirst({
-    where: { id, ownerId: req.user.id }, // << SCOPE
-    include: { template: true },
+  const camp = await prisma.campaign.findFirst({
+    where: { id, ownerId: req.user.id },
   });
-  if (!campaign) return res.status(404).json({ message: "not found" });
+  if (!camp) return res.status(404).json({ message: "not found" });
 
-  if (!["draft", "scheduled", "paused"].includes(campaign.status)) {
-    return res
-      .status(400)
-      .json({ message: `cannot enqueue from status ${campaign.status}` });
-  }
-
-  // Fetch list members that are currently subscribed
-  const members = await prisma.listMembership.findMany({
-    where: { listId: campaign.listId, contact: { isSubscribed: true } },
-    include: { contact: true },
-  });
-  if (members.length === 0) {
-    return res.status(400).json({ message: "list has no subscribed members" });
-  }
-
-  // Build messages (scoped) with final rendered text
-  const messagesData = members.map((m) => ({
-    ownerId: req.user.id, // << SCOPE
-    campaignId: campaign.id,
-    contactId: m.contactId,
-    to: m.contact.phone,
-    text: render(campaign.template.text, m.contact),
-    trackingId: newTrackingId(),
-    status: "queued",
-  }));
-
-  // Transaction: update campaign + insert messages
-  await prisma.$transaction([
-    prisma.campaign.update({
-      where: { id: campaign.id },
-      data: {
-        status: "sending",
-        startedAt: new Date(),
-        total: members.length, // set exact number of subscribed recipients at enqueue time
-      },
-    }),
-    prisma.campaignMessage.createMany({
-      data: messagesData,
-      skipDuplicates: true, // if retry, avoid duplicate trackingIds (should be unique anyway)
-    }),
-  ]);
-
-  // Enqueue background jobs (idempotent via jobId)
-  const toEnqueue = await prisma.campaignMessage.findMany({
-    where: {
-      ownerId: req.user.id, // << SCOPE
-      campaignId: campaign.id,
-      status: "queued",
-      providerMessageId: null,
-    },
-    select: { id: true },
-  });
-
-  let enqueuedJobs = 0;
-  if (smsQueue) {
-    for (const m of toEnqueue) {
-      await smsQueue.add(
-        "sendSMS",
-        { messageId: m.id, userId: req.user.id },
-        { jobId: `message:${m.id}` } // idempotent
-      );
-      enqueuedJobs++;
+  const result = await enqueueCampaign(id);
+  if (!result.ok) {
+    // map reasons -> proper responses
+    if (result.reason?.startsWith("invalid_status")) {
+      return res.status(409).json({ message: result.reason });
     }
-  } else {
-    console.warn("[Queue] Not available — messages created but not enqueued");
+    if (result.reason === "no_recipients") {
+      return res
+        .status(400)
+        .json({ message: "list has no subscribed members" });
+    }
+    if (result.reason === "already_sending") {
+      return res.status(409).json({ message: "already sending" });
+    }
+    if (result.reason === "not_found") {
+      return res.status(404).json({ message: "not found" });
+    }
+    if (result.reason === "insufficient_credits") {
+      return res.status(402).json({ message: "insufficient_credits" }); // 402 Payment Required (semantically ok)
+    }
+    return res.status(400).json({ message: result.reason || "cannot enqueue" });
   }
 
-  res.json({ queued: messagesData.length, enqueuedJobs });
+  res.json({ queued: result.created, enqueuedJobs: result.enqueuedJobs });
+});
+
+/* =========================================================
+ * POST /campaigns/:id/schedule (protected)
+ * Set or change scheduledAt and create/update delayed job (scoped).
+ * Body: { scheduledAt }
+ * ========================================================= */
+router.post("/campaigns/:id/schedule", requireAuth, async (req, res) => {
+  const id = Number(req.params.id);
+  const { scheduledAt } = req.body || {};
+  if (!id) return res.status(400).json({ message: "invalid id" });
+  if (!scheduledAt)
+    return res.status(400).json({ message: "scheduledAt required" });
+
+  const camp = await prisma.campaign.findFirst({
+    where: { id, ownerId: req.user.id },
+  });
+  if (!camp) return res.status(404).json({ message: "not found" });
+
+  const updated = await prisma.campaign.update({
+    where: { id },
+    data: { status: "scheduled", scheduledAt: new Date(scheduledAt) },
+  });
+
+  if (schedulerQueue) {
+    const delay = msUntil(updated.scheduledAt);
+    await schedulerQueue.add(
+      "enqueueCampaign",
+      { campaignId: id },
+      { jobId: `campaign:schedule:${id}`, delay }
+    );
+  }
+
+  res.json({ ok: true, scheduledAt: updated.scheduledAt });
+});
+
+/* =========================================================
+ * POST /campaigns/:id/unschedule (protected)
+ * Remove scheduledAt and cancel delayed job (scoped).
+ * ========================================================= */
+router.post("/campaigns/:id/unschedule", requireAuth, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!id) return res.status(400).json({ message: "invalid id" });
+
+  const camp = await prisma.campaign.findFirst({
+    where: { id, ownerId: req.user.id },
+  });
+  if (!camp) return res.status(404).json({ message: "not found" });
+
+  await prisma.campaign.update({
+    where: { id },
+    data: { status: "draft", scheduledAt: null },
+  });
+
+  if (schedulerQueue) {
+    try {
+      await schedulerQueue.remove(`campaign:schedule:${id}`);
+    } catch (_) {}
+  }
+
+  res.json({ ok: true });
 });
 
 /* =========================================================
  * GET /campaigns/:id/status (protected)
- * Lightweight metrics for a single campaign (scoped).
+ * Lightweight metrics (scoped).
  * ========================================================= */
 router.get("/campaigns/:id/status", requireAuth, async (req, res) => {
   const id = Number(req.params.id);
   if (!id) return res.status(400).json({ message: "invalid id" });
 
   const c = await prisma.campaign.findFirst({
-    where: { id, ownerId: req.user.id }, // << SCOPE
+    where: { id, ownerId: req.user.id },
   });
   if (!c) return res.status(404).json({ message: "not found" });
 
   const [queued, sent, failed] = await Promise.all([
     prisma.campaignMessage.count({
-      where: { ownerId: req.user.id, campaignId: id, status: "queued" }, // << SCOPE
+      where: { ownerId: req.user.id, campaignId: id, status: "queued" },
     }),
     prisma.campaignMessage.count({
-      where: { ownerId: req.user.id, campaignId: id, status: "sent" }, // << SCOPE
+      where: { ownerId: req.user.id, campaignId: id, status: "sent" },
     }),
     prisma.campaignMessage.count({
-      where: { ownerId: req.user.id, campaignId: id, status: "failed" }, // << SCOPE
+      where: { ownerId: req.user.id, campaignId: id, status: "failed" },
     }),
   ]);
 
@@ -265,29 +288,26 @@ router.get("/campaigns/:id/status", requireAuth, async (req, res) => {
 });
 
 /* =========================================================
- * POST /campaigns/:id/fake-send (protected, dev-only)
- * Progress N queued -> sent, then auto-complete campaign if none left.
- * Scopes to owner.
+ * POST /campaigns/:id/fake-send (protected, dev only)
+ * Force-advance N queued -> sent (scoped). Auto-complete if none left.
  * ========================================================= */
 router.post("/campaigns/:id/fake-send", requireAuth, async (req, res) => {
   const id = Number(req.params.id);
   if (!id) return res.status(400).json({ message: "invalid id" });
 
-  // Ensure campaign belongs to owner
   const owned = await prisma.campaign.findFirst({
-    where: { id, ownerId: req.user.id }, // << SCOPE
+    where: { id, ownerId: req.user.id },
   });
   if (!owned) return res.status(404).json({ message: "not found" });
 
   const limit = Math.min(Number(req.body?.limit || 50), 500);
 
   const queued = await prisma.campaignMessage.findMany({
-    where: { ownerId: req.user.id, campaignId: id, status: "queued" }, // << SCOPE
+    where: { ownerId: req.user.id, campaignId: id, status: "queued" },
     take: limit,
     orderBy: { id: "asc" },
   });
-
-  if (queued.length === 0) return res.json({ updated: 0 });
+  if (!queued.length) return res.json({ updated: 0 });
 
   const ids = queued.map((m) => m.id);
 
@@ -297,7 +317,7 @@ router.post("/campaigns/:id/fake-send", requireAuth, async (req, res) => {
   });
 
   const remainingQueued = await prisma.campaignMessage.count({
-    where: { ownerId: req.user.id, campaignId: id, status: "queued" }, // << SCOPE
+    where: { ownerId: req.user.id, campaignId: id, status: "queued" },
   });
 
   if (remainingQueued === 0) {

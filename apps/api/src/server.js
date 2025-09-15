@@ -112,6 +112,9 @@ app.use(require('./routes/mitto.webhooks'));
 // Public tracking endpoints (QR redeem check etc.)
 app.use('/tracking', require('./routes/tracking'));
 
+// /docs and /openapi.json
+app.use(require('./routes/docs')); 
+
 // ========= ERROR HANDLERS =========
 
 // 404 for unknown API routes

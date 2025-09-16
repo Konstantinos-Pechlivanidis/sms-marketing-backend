@@ -2,11 +2,8 @@
 const { Router } = require("express");
 const prisma = require("../lib/prisma");
 const requireAuth = require("../middleware/requireAuth");
-const {
-  ensureWallet,
-  getBalance,
-  credit,
-} = require("../services/wallet.service");
+const { getBalance, credit } = require("../services/wallet.service");
+const { requireIdempotencyKey } = require("../middleware/idempotency");
 
 const r = Router();
 
@@ -29,10 +26,7 @@ r.get("/billing/balance", requireAuth, async (req, res, next) => {
 r.get("/billing/transactions", requireAuth, async (req, res, next) => {
   try {
     const page = Math.max(1, Number(req.query.page || 1));
-    const pageSize = Math.min(
-      100,
-      Math.max(1, Number(req.query.pageSize || 10))
-    );
+    const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize || 10)));
     const [total, items] = await Promise.all([
       prisma.creditTransaction.count({ where: { ownerId: req.user.id } }),
       prisma.creditTransaction.findMany({
@@ -70,7 +64,6 @@ r.get("/billing/packages", requireAuth, async (_req, res, next) => {
  */
 r.post("/billing/seed-packages", requireAuth, async (req, res, next) => {
   try {
-    // Simple guard: allow only if env allows seeding
     if (process.env.ALLOW_BILLING_SEED !== "1") {
       return res.status(403).json({ message: "seeding disabled" });
     }
@@ -84,7 +77,6 @@ r.post("/billing/seed-packages", requireAuth, async (req, res, next) => {
       }))
       .filter((x) => x.name && x.units > 0 && x.priceCents >= 0);
 
-    // Upsert by unique name
     for (const p of data) {
       await prisma.package.upsert({
         where: { name: p.name },
@@ -102,23 +94,20 @@ r.post("/billing/seed-packages", requireAuth, async (req, res, next) => {
   }
 });
 
-/**
- * POST /billing/purchase
- * Body: { packageId }
- * MVP: instantly "paid": creates Purchase + credits wallet.
- */
-r.post("/billing/purchase", requireAuth, async (req, res, next) => {
+/* ---------------------------------------
+   Helper used by both purchase endpoints
+   --------------------------------------- */
+async function purchaseHandler(req, res, next) {
   try {
     const packageId = Number(req.body?.packageId || 0);
-    if (!packageId)
-      return res.status(400).json({ message: "packageId required" });
+    if (!packageId) return res.status(400).json({ message: "packageId required" });
 
     const pkg = await prisma.package.findFirst({
       where: { id: packageId, active: true },
     });
     if (!pkg) return res.status(404).json({ message: "package not found" });
 
-    // Create purchase row (paid for MVP)
+    // Create purchase row (MVP: immediately paid)
     const purchase = await prisma.purchase.create({
       data: {
         ownerId: req.user.id,
@@ -135,61 +124,40 @@ r.post("/billing/purchase", requireAuth, async (req, res, next) => {
       meta: { purchaseId: purchase.id, packageId: pkg.id },
     });
 
-    res
-      .status(201)
-      .json({ ok: true, purchase, credited: pkg.units, balance, txn });
+    const payload = { ok: true, purchase, credited: pkg.units, balance, txn };
+    // If idempotency is active, cache the response (middleware adds saveIdempotency)
+    res.saveIdempotency?.(payload, 201);
+    res.status(201).json(payload);
+  } catch (e) {
+    next(e);
+  }
+}
+
+/**
+ * POST /billing/purchase
+ * Body: { packageId }
+ * Uses Idempotency-Key to prevent duplicate charging on retries/double-clicks.
+ */
+r.post("/billing/purchase", requireAuth, requireIdempotencyKey, purchaseHandler);
+
+/* -------------------------
+   Aliases for FE compatibility
+   ------------------------- */
+
+/** GET /credit-packs  -> same as /billing/packages (authenticated) */
+r.get("/credit-packs", requireAuth, async (_req, res, next) => {
+  try {
+    const items = await prisma.package.findMany({
+      where: { active: true },
+      orderBy: { units: "asc" },
+    });
+    res.json(items);
   } catch (e) {
     next(e);
   }
 });
 
-// aliases for frontend compatibility
-r.get("/credit-packs", async (req, res, next) => {
-  req.url = "/billing/packages"; // delegate
-  next("route");
-});
-r.post("/purchase-credits", async (req, res, next) => {
-  req.url = "/billing/purchase";
-  next("route");
-});
-
-r.post(
-  "/billing/purchase",
-  requireAuth,
-+ requireIdempotencyKey,
-  async (req, res, next) => {
-    try {
-      const packageId = Number(req.body?.packageId || 0);
-      if (!packageId) return res.status(400).json({ message: "packageId required" });
-
-      const pkg = await prisma.package.findFirst({
-        where: { id: packageId, active: true },
-      });
-      if (!pkg) return res.status(404).json({ message: "package not found" });
-
-      const purchase = await prisma.purchase.create({
-        data: {
-          ownerId: req.user.id,
-          packageId: pkg.id,
-          units: pkg.units,
-          priceCents: pkg.priceCents,
-          status: "paid",
-        },
-      });
-
-      const { balance, txn } = await credit(req.user.id, pkg.units, {
-        reason: `purchase:${pkg.name}`,
-        meta: { purchaseId: purchase.id, packageId: pkg.id },
-      });
-
-      const payload = { ok: true, purchase, credited: pkg.units, balance, txn };
-+     // save idempotent response for 5 minutes
-+     res.saveIdempotency?.(payload, 201);
-      res.status(201).json(payload);
-    } catch (e) {
-      next(e);
-    }
-  }
-);
+/** POST /purchase-credits -> same as /billing/purchase (authenticated + idempotent) */
+r.post("/purchase-credits", requireAuth, requireIdempotencyKey, purchaseHandler);
 
 module.exports = r;

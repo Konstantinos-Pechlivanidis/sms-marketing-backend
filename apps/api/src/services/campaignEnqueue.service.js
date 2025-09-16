@@ -1,16 +1,50 @@
 // apps/api/src/services/campaignEnqueue.service.js
 const crypto = require('node:crypto');
-const { Queue } = require('bullmq');
-const IORedis = require('ioredis');
 const prisma = require('../lib/prisma');
-const { debit } = require('../services/wallet.service'); // assumes you have debit(); you already use refund() in worker
+const { debit } = require('../services/wallet.service');
 
-// Reuse Redis from env (same as worker)
-const url = process.env.REDIS_URL || 'redis://localhost:6379';
-const connection = new IORedis(url, { maxRetriesPerRequest: null });
-connection.on('error', (e) => console.warn('[Redis] producer connection error:', e.message));
+// Optional BullMQ/Redis. We load lazily to avoid connection errors when disabled.
+let Queue, IORedis;
+try {
+  Queue = require('bullmq').Queue;
+  IORedis = require('ioredis');
+} catch (_) {
+  // bullmq/ioredis not installed — that's okay for QUEUE_DISABLED mode
+}
 
-const smsQueue = new Queue('smsQueue', { connection });
+const QUEUE_DISABLED = process.env.QUEUE_DISABLED === '1';
+const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
+
+let smsQueue = null;
+let producerConn = null;
+let queueInitTried = false;
+
+async function getQueue() {
+  if (QUEUE_DISABLED) return null;
+  if (smsQueue || queueInitTried) return smsQueue;
+  queueInitTried = true;
+
+  // If deps are missing, bail quietly
+  if (!Queue || !IORedis) return null;
+
+  try {
+    // Basic sanity: if REDIS_URL is obviously unset, don't try
+    if (!REDIS_URL || !/^redis(s)?:\/\//i.test(REDIS_URL)) return null;
+
+    producerConn = new IORedis(REDIS_URL, { maxRetriesPerRequest: null });
+    producerConn.on('error', (e) => {
+      // Downgrade to debug-level: avoid noisy console in dev
+      console.debug('[Redis] producer connection issue:', e?.message);
+    });
+
+    smsQueue = new Queue('smsQueue', { connection: producerConn });
+    return smsQueue;
+  } catch (_) {
+    // Fail open: treat as no queue
+    smsQueue = null;
+    return null;
+  }
+}
 
 function renderText(text, contact) {
   return String(text || '')
@@ -19,18 +53,17 @@ function renderText(text, contact) {
     .replace(/\{\{email\}\}/g, contact.email || '');
 }
 
-// simple unique token for trackingId
 function newTrackingId() {
   return crypto.randomBytes(12).toString('hex'); // 24 chars
 }
 
 /**
  * Enqueue a campaign:
- *  - Validates campaign is owned by someone and is enqueueable
- *  - Builds recipient set from the campaign's list (subscribed contacts only)
- *  - Debits wallet atomically for N credits
- *  - Creates N CampaignMessage rows
- *  - Adds N jobs to BullMQ (payload: { messageId })
+ *  - Validates enqueueable
+ *  - Collects subscribed recipients
+ *  - Debits credits atomically
+ *  - Creates CampaignMessage rows (status=queued)
+ *  - Tries to add BullMQ jobs (if queue available)
  */
 async function enqueueCampaign(campaignId) {
   const campaign = await prisma.campaign.findUnique({
@@ -39,9 +72,7 @@ async function enqueueCampaign(campaignId) {
       template: true,
       list: {
         include: {
-          memberships: {
-            include: { contact: true }
-          }
+          memberships: { include: { contact: true } }
         }
       }
     }
@@ -53,19 +84,16 @@ async function enqueueCampaign(campaignId) {
     return { ok: false, reason: 'not_enqueueable' };
   }
 
-  // Build recipients: subscribed, has phone
+  // Build recipients: subscribed & has phone
   const contacts = campaign.list.memberships
     .map(m => m.contact)
     .filter(c => c?.isSubscribed && c?.phone);
 
-  // Unique by contactId (defensive)
+  // Unique by contactId
   const seen = new Set();
   const recipients = [];
   for (const c of contacts) {
-    if (!seen.has(c.id)) {
-      seen.add(c.id);
-      recipients.push(c);
-    }
+    if (!seen.has(c.id)) { seen.add(c.id); recipients.push(c); }
   }
 
   if (recipients.length === 0) {
@@ -73,78 +101,75 @@ async function enqueueCampaign(campaignId) {
   }
 
   const now = new Date();
-
-  // All-or-nothing: debit credits, flip campaign to sending, create messages
-  // We avoid createMany -> no IDs returned; we want IDs for queue jobs.
-  // Chunk inserts to keep memory stable for large lists.
   const CHUNK = 500;
 
   const result = await prisma.$transaction(async (tx) => {
-    // 1) Debit credits
+    // 1) Debit credits for N recipients
     await debit(campaign.ownerId, recipients.length, {
       reason: `enqueue:campaign:${campaign.id}`,
       campaignId: campaign.id
     });
 
-    // 2) Update campaign -> sending
+    // 2) Flip campaign -> sending
     await tx.campaign.update({
       where: { id: campaign.id },
       data: {
         status: 'sending',
         startedAt: now,
         total: recipients.length,
-        // when enqueuing a previously scheduled campaign, clear scheduledAt
         scheduledAt: null
       }
     });
 
-    // 3) Create messages (in chunks), queue jobs
+    // 3) Create messages and collect their IDs
     let createdCount = 0;
+    const createdIds = [];
 
     for (let i = 0; i < recipients.length; i += CHUNK) {
       const slice = recipients.slice(i, i + CHUNK);
-
-      // Insert one-by-one to get IDs immediately (OK for MVP; chunked to reduce round-trips)
-      const createdIds = [];
       for (const contact of slice) {
         const text = renderText(campaign.template.text, contact);
         const trackingId = newTrackingId();
-
         const msg = await tx.campaignMessage.create({
           data: {
             ownerId: campaign.ownerId,
             campaignId: campaign.id,
             contactId: contact.id,
-            to: contact.phone,   // already normalized to E.164 by contacts API
+            to: contact.phone,
             text,
             trackingId,
             status: 'queued'
           },
           select: { id: true }
         });
-
         createdIds.push(msg.id);
       }
+      createdCount += slice.length;
+    }
 
-      // Queue jobs for this chunk
-      const jobs = createdIds.map((id) => ({
+    return { createdCount, createdIds };
+  });
+
+  // 4) Try to queue jobs (best effort)
+  const q = await getQueue();
+  if (q && result.createdIds.length) {
+    try {
+      const jobs = result.createdIds.map((id) => ({
         name: 'send',
         data: { messageId: id },
         opts: { removeOnComplete: 1000, removeOnFail: 5000 }
       }));
-      await smsQueue.addBulk(jobs);
-
-      createdCount += createdIds.length;
+      await q.addBulk(jobs);
+      return { ok: true, total: recipients.length, enqueued: result.createdCount };
+    } catch (e) {
+      // Queue is down -> leave messages queued, allow retry later
+      console.debug('[Queue] addBulk failed; leaving messages queued:', e?.message);
+      return { ok: true, total: recipients.length, enqueued: 0, queueDisabled: true };
     }
+  }
 
-    return { createdCount };
-  });
-
-  return {
-    ok: true,
-    total: recipients.length,
-    enqueued: result.createdCount
-  };
+  // No queue available (disabled or missing)
+  return { ok: true, total: recipients.length, enqueued: 0, queueDisabled: true };
 }
 
 module.exports = { enqueueCampaign };

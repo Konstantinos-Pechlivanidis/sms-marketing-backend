@@ -8,7 +8,13 @@ const { scoped } = require('../lib/policies');
 // Rate limit helpers (Redis-backed if REDIS_URL set, else per-process memory)
 const { createLimiter, rateLimitByIp, rateLimitByKey } = require('../lib/ratelimit');
 
+// Strong phone validation / normalization
+const { normalizeToE164, isE164 } = require('../lib/phone');
+
 const router = express.Router();
+
+// Default country for parsing non-E.164 inputs (can be overridden via env)
+const DEFAULT_COUNTRY = process.env.DEFAULT_PHONE_COUNTRY || 'GR';
 
 /** Create a random raw token and return its SHA-256 hex hash (for storage). */
 function newUnsubTokenHash() {
@@ -20,19 +26,6 @@ function newUnsubTokenHash() {
 /** Hash helper for incoming public tokens */
 function sha256Hex(s) {
   return crypto.createHash('sha256').update(s).digest('hex');
-}
-
-/** Basic phone guard (very light for MVP). You can replace with libphonenumber later. */
-function isPlausiblePhone(s) {
-  if (!s) return false;
-  const v = String(s).trim();
-  // allow + and digits, length 8..20
-  return /^[+\d][\d]{7,19}$/.test(v.replace(/\s+/g, ''));
-}
-
-/** Normalize phone lightly (MVP). Later: libphonenumber-js for E.164. */
-function normalizePhone(s) {
-  return String(s).replace(/\s+/g, '');
 }
 
 /* -------------------- Rate limiters -------------------- */
@@ -47,19 +40,27 @@ const unsubTokenLimiter = createLimiter({ keyPrefix: 'rl:unsub:token', points: 5
 /* ---------------------------------------------------------
  * POST /contacts  (protected)
  * Create a contact scoped to the authenticated owner.
+ * Stores phone in strict E.164 format.
  * --------------------------------------------------------- */
 router.post(
   '/contacts',
   requireAuth,
   rateLimitByIp(writeIpLimiter),
-  async (req, res) => {
+  async (req, res, next) => {
     try {
       const { phone, email, firstName, lastName } = req.body || {};
       if (!phone) return res.status(400).json({ message: 'phone required' });
 
-      const normalized = normalizePhone(phone);
-      if (!isPlausiblePhone(normalized)) {
-        return res.status(400).json({ message: 'invalid phone' });
+      // Normalize & validate to E.164
+      let e164;
+      if (isE164(phone)) {
+        e164 = phone;
+      } else {
+        const norm = normalizeToE164(phone, DEFAULT_COUNTRY);
+        if (!norm.ok) {
+          return res.status(400).json({ message: `invalid phone (${norm.reason})` });
+        }
+        e164 = norm.e164;
       }
 
       // Prepare unsubscribe token hash if absent; we don't return raw token here.
@@ -67,12 +68,12 @@ router.post(
 
       const contact = await prisma.contact.create({
         data: {
-          ownerId: req.user.id,                 // <-- SCOPE
-          phone: normalized,
+          ownerId: req.user.id, // <-- SCOPE
+          phone: e164,
           email: email || null,
           firstName: firstName || null,
           lastName: lastName || null,
-          unsubscribeTokenHash: hash            // store only the hash (raw can be rotated later)
+          unsubscribeTokenHash: hash // store only the hash (raw can be rotated later)
         }
       });
 
@@ -82,7 +83,7 @@ router.post(
       if (e.code === 'P2002') {
         return res.status(409).json({ message: 'phone already exists' });
       }
-      res.status(400).json({ message: e.message || 'bad request' });
+      next(e);
     }
   }
 );
@@ -91,64 +92,74 @@ router.post(
  * GET /contacts  (protected)
  * List contacts (paginated + search).
  * --------------------------------------------------------- */
-router.get('/contacts', requireAuth, async (req, res) => {
-  const page = Math.max(1, parseInt(req.query.page || '1', 10));
-  const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize || '20', 10)));
-  const q = (req.query.q || '').toString().trim();
-  const sub = (req.query.isSubscribed || '').toString().toLowerCase();
+router.get('/contacts', requireAuth, async (req, res, next) => {
+  try {
+    const page = Math.max(1, parseInt(req.query.page || '1', 10));
+    const pageSize = Math.min(100, Math.max(1, parseInt(req.query.pageSize || '20', 10)));
+    const q = (req.query.q || '').toString().trim();
+    const sub = (req.query.isSubscribed || '').toString().toLowerCase();
 
-  const where = { ...scoped(req.user.id) };
+    const where = { ...scoped(req.user.id) };
 
-  if (q) {
-    where.OR = [
-      { phone: { contains: q, mode: 'insensitive' } },
-      { email: { contains: q, mode: 'insensitive' } },
-      { firstName: { contains: q, mode: 'insensitive' } },
-      { lastName: { contains: q, mode: 'insensitive' } },
-    ];
+    if (q) {
+      // Searching against stored E.164 phones still works with "contains",
+      // and also supports name/email searches.
+      where.OR = [
+        { phone: { contains: q, mode: 'insensitive' } },
+        { email: { contains: q, mode: 'insensitive' } },
+        { firstName: { contains: q, mode: 'insensitive' } },
+        { lastName: { contains: q, mode: 'insensitive' } },
+      ];
+    }
+
+    if (sub === 'true') where.isSubscribed = true;
+    if (sub === 'false') where.isSubscribed = false;
+
+    const [items, total] = await Promise.all([
+      prisma.contact.findMany({
+        where,
+        orderBy: { id: 'desc' },
+        skip: (page - 1) * pageSize,
+        take: pageSize
+      }),
+      prisma.contact.count({ where })
+    ]);
+
+    res.json({ items, total, page, pageSize });
+  } catch (e) {
+    next(e);
   }
-
-  if (sub === 'true') where.isSubscribed = true;
-  if (sub === 'false') where.isSubscribed = false;
-
-  const [items, total] = await Promise.all([
-    prisma.contact.findMany({
-      where,
-      orderBy: { id: 'desc' },
-      skip: (page - 1) * pageSize,
-      take: pageSize
-    }),
-    prisma.contact.count({ where })
-  ]);
-
-  res.json({ items, total, page, pageSize });
 });
 
 /* ---------------------------------------------------------
  * GET /contacts/:id  (protected)
  * Fetch one contact scoped to owner.
  * --------------------------------------------------------- */
-router.get('/contacts/:id', requireAuth, async (req, res) => {
-  const id = Number(req.params.id);
-  if (!id) return res.status(400).json({ message: 'invalid id' });
+router.get('/contacts/:id', requireAuth, async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    if (!id) return res.status(400).json({ message: 'invalid id' });
 
-  const contact = await prisma.contact.findFirst({
-    where: { id, ownerId: req.user.id } // SCOPE
-  });
+    const contact = await prisma.contact.findFirst({
+      where: { id, ownerId: req.user.id } // SCOPE
+    });
 
-  if (!contact) return res.status(404).json({ message: 'not found' });
-  res.json(contact);
+    if (!contact) return res.status(404).json({ message: 'not found' });
+    res.json(contact);
+  } catch (e) {
+    next(e);
+  }
 });
 
 /* ---------------------------------------------------------
  * PUT /contacts/:id  (protected)
- * Update a contact (scoped).
+ * Update a contact (scoped). Phone is re-validated and stored as E.164.
  * --------------------------------------------------------- */
 router.put(
   '/contacts/:id',
   requireAuth,
   rateLimitByIp(writeIpLimiter),
-  async (req, res) => {
+  async (req, res, next) => {
     try {
       const id = Number(req.params.id);
       if (!id) return res.status(400).json({ message: 'invalid id' });
@@ -156,19 +167,27 @@ router.put(
       const { phone, email, firstName, lastName, isSubscribed } = req.body || {};
       const data = {};
 
-      if (phone !== undefined) {
-        const norm = normalizePhone(phone);
-        if (!isPlausiblePhone(norm)) {
-          return res.status(400).json({ message: 'invalid phone' });
+      if (typeof phone !== 'undefined') {
+        if (phone === null || phone === '') {
+          return res.status(400).json({ message: 'phone cannot be empty' });
         }
-        data.phone = norm;
+        let e164;
+        if (isE164(phone)) {
+          e164 = phone;
+        } else {
+          const norm = normalizeToE164(phone, DEFAULT_COUNTRY);
+          if (!norm.ok) return res.status(400).json({ message: `invalid phone (${norm.reason})` });
+          e164 = norm.e164;
+        }
+        data.phone = e164;
       }
-      if (email !== undefined) data.email = email || null;
-      if (firstName !== undefined) data.firstName = firstName || null;
-      if (lastName !== undefined) data.lastName = lastName || null;
+
+      if (typeof email !== 'undefined') data.email = email || null;
+      if (typeof firstName !== 'undefined') data.firstName = firstName || null;
+      if (typeof lastName !== 'undefined') data.lastName = lastName || null;
 
       // Optional allow toggling isSubscribed from admin
-      if (isSubscribed !== undefined) {
+      if (typeof isSubscribed !== 'undefined') {
         data.isSubscribed = Boolean(isSubscribed);
         if (data.isSubscribed === false) {
           data.unsubscribedAt = new Date(); // mark time when admin unsubscribes
@@ -177,8 +196,9 @@ router.put(
         }
       }
 
+      // Guard owner scope
       const r = await prisma.contact.updateMany({
-        where: { id, ownerId: req.user.id },  // SCOPE
+        where: { id, ownerId: req.user.id },
         data
       });
 
@@ -191,7 +211,7 @@ router.put(
       res.json(updated);
     } catch (e) {
       if (e.code === 'P2002') return res.status(409).json({ message: 'phone already exists' });
-      res.status(400).json({ message: e.message || 'bad request' });
+      next(e);
     }
   }
 );
@@ -204,7 +224,7 @@ router.delete(
   '/contacts/:id',
   requireAuth,
   rateLimitByIp(writeIpLimiter),
-  async (req, res) => {
+  async (req, res, next) => {
     try {
       const id = Number(req.params.id);
       if (!id) return res.status(400).json({ message: 'invalid id' });
@@ -216,7 +236,7 @@ router.delete(
       if (r.count === 0) return res.status(404).json({ message: 'not found' });
       res.json({ ok: true });
     } catch (e) {
-      res.status(400).json({ message: e.message || 'bad request' });
+      next(e);
     }
   }
 );
@@ -231,7 +251,7 @@ router.post(
   '/contacts/unsubscribe',
   rateLimitByIp(unsubIpLimiter),
   rateLimitByKey(unsubTokenLimiter, (req) => (req.body?.token || '').slice(0, 64)),
-  async (req, res) => {
+  async (req, res, next) => {
     try {
       const { token } = req.body || {};
       if (!token) return res.status(400).json({ message: 'token required' });
@@ -251,7 +271,7 @@ router.post(
 
       res.json({ ok: true });
     } catch (e) {
-      res.status(400).json({ message: e.message || 'bad request' });
+      next(e);
     }
   }
 );

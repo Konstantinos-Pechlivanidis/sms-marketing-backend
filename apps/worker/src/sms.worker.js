@@ -10,8 +10,7 @@ const { Worker } = require('bullmq');
 const IORedis = require('ioredis');
 const prisma = require('../../api/src/lib/prisma');
 const { sendSingle } = require('../../api/src/services/mitto.service');
-const { ensureFreshUnsubToken } = require('../../api/src/services/unsubToken.service'); // if you have it
-const { refund } = require('../../api/src/services/wallet.service'); // << NEW
+const { refund } = require('../../api/src/services/wallet.service');
 
 const url = process.env.REDIS_URL || 'redis://localhost:6379';
 const connection = new IORedis(url, { maxRetriesPerRequest: null });
@@ -21,10 +20,27 @@ const concurrency = Number(process.env.WORKER_CONCURRENCY || 5);
 
 function isRetryable(err) {
   const status = err?.status;
-  if (!status) return true;      // network/timeout
-  if (status >= 500) return true; // provider/server error
+  if (!status) return true;        // network/timeout
+  if (status >= 500) return true;  // provider/server error
   if (status === 429) return true; // rate limited
   return false;                    // 4xx hard fail
+}
+
+/**
+ * If no more messages are in 'queued' for this campaign, mark it completed.
+ * This runs after transitioning a message to 'sent' or 'failed'.
+ */
+async function maybeCompleteCampaign(campaignId) {
+  if (!campaignId) return;
+  const remaining = await prisma.campaignMessage.count({
+    where: { campaignId, status: 'queued' }
+  });
+  if (remaining === 0) {
+    await prisma.campaign.update({
+      where: { id: campaignId },
+      data: { status: 'completed', completedAt: new Date() }
+    });
+  }
 }
 
 const worker = new Worker(
@@ -42,12 +58,10 @@ const worker = new Worker(
     if (!msg) return;
 
     try {
-      // Build final text: append redeem + unsubscribe links if you already do it
-      // (omitted here for brevity; assume text already includes links, or you have existing logic)
-
+      // If you build final text (redeem/unsub links), do it here.
       const resp = await sendSingle({
         userId: msg.campaign.createdById,
-        destination: msg.to,
+        destination: msg.to, // NOTE: keep as 'destination' to match your service signature
         text: msg.text
       });
 
@@ -61,14 +75,18 @@ const worker = new Worker(
           status: 'sent'
         }
       });
+
+      // Try campaign auto-complete (no queued left)
+      await maybeCompleteCampaign(msg.campaign.id);
     } catch (e) {
       const retryable = isRetryable(e);
+
       await prisma.campaignMessage.update({
         where: { id: msg.id },
         data: {
           failedAt: retryable ? null : new Date(),
           status: retryable ? 'queued' : 'failed',
-          error: e.message
+          error: e?.message?.slice(0, 500) || 'send_failed'
         }
       });
 
@@ -84,6 +102,8 @@ const worker = new Worker(
         } catch (rf) {
           console.warn('[Wallet] refund failed:', rf?.message);
         }
+        // After a terminal failure, attempt campaign auto-complete
+        await maybeCompleteCampaign(msg.campaign.id);
       }
 
       if (retryable) throw e;

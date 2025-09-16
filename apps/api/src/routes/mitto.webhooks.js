@@ -4,9 +4,12 @@ const prisma = require('../lib/prisma');
 const pino = require('pino');
 const crypto = require('node:crypto');
 const { cacheDel } = require('../lib/cache'); // safe no-op if Redis disabled
+const { normalizeToE164, isE164 } = require('../lib/phone');
 
 const router = express.Router();
 const logger = pino({ transport: { target: 'pino-pretty' } });
+
+const DEFAULT_COUNTRY = process.env.DEFAULT_PHONE_COUNTRY || 'GR';
 
 /**
  * Dev + Prod verification
@@ -65,6 +68,22 @@ async function persistWebhook(provider, eventType, payload, providerMessageId) {
 }
 
 /**
+ * Auto-complete helper: if no queued messages remain for a campaign, mark it completed.
+ */
+async function maybeCompleteCampaign(campaignId) {
+  if (!campaignId) return;
+  const remaining = await prisma.campaignMessage.count({
+    where: { campaignId, status: 'queued' }
+  });
+  if (remaining === 0) {
+    await prisma.campaign.update({
+      where: { id: campaignId },
+      data: { status: 'completed', completedAt: new Date() }
+    });
+  }
+}
+
+/**
  * --- Delivery Status (DLR) ---
  * Accepts single object or array of objects. Always 202 to avoid retry storms.
  */
@@ -76,6 +95,7 @@ router.post('/webhooks/mitto/dlr', async (req, res) => {
     const events = Array.isArray(body) ? body : [body];
 
     let updated = 0;
+    const touchedCampaigns = new Set();
 
     for (const ev of events) {
       // Flexible field extraction (Mitto or similar providers)
@@ -135,11 +155,15 @@ router.post('/webhooks/mitto/dlr', async (req, res) => {
         for (const m of msgs) {
           const key = `stats:campaign:v1:${m.ownerId}:${m.campaignId}`;
           try { await cacheDel(key); } catch (_) {}
+          touchedCampaigns.add(m.campaignId);
         }
       } catch (e) {
         logger.error({ err: e, providerId, statusIn }, 'DLR update error');
       }
     }
+
+    // Try to auto-complete any campaigns that no longer have queued messages
+    await Promise.all([...touchedCampaigns].map(id => maybeCompleteCampaign(id)));
 
     // Always accept to prevent provider retries
     return res.status(202).json({ ok: true, updated });
@@ -153,11 +177,21 @@ router.post('/webhooks/mitto/dlr', async (req, res) => {
  * --- Inbound MO (STOP) ---
  * Unsubscribes contact on STOP. Always 202.
  */
-function normalizeMsisdn(s) {
-  if (!s) return null;
-  let v = String(s).trim();
+function normalizeMsisdn(input) {
+  if (!input) return null;
+  const s = String(input).trim();
+
+  // Already E.164?
+  if (isE164(s)) return s;
+
+  // Try to parse with default country
+  const norm = normalizeToE164(s, DEFAULT_COUNTRY);
+  if (norm.ok) return norm.e164;
+
+  // Fallbacks (very defensive; should rarely run if libphonenumber handles it)
+  let v = s;
   if (v.startsWith('00')) v = '+' + v.slice(2);
-  if (!v.startsWith('+') && /^\d{10,15}$/.test(v)) v = '+30' + v; // adjust default country as needed
+  if (!v.startsWith('+') && /^\d{10,15}$/.test(v)) v = '+30' + v; // adjust default as last resort
   return v;
 }
 

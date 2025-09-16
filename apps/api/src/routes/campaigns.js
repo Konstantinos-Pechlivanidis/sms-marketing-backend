@@ -272,7 +272,7 @@ router.get("/campaigns/:id/status", requireAuth, async (req, res) => {
   });
   if (!c) return res.status(404).json({ message: "not found" });
 
-  const [queued, sent, failed] = await Promise.all([
+  const [queued, sent, failed, delivered] = await Promise.all([
     prisma.campaignMessage.count({
       where: { ownerId: req.user.id, campaignId: id, status: "queued" },
     }),
@@ -282,9 +282,12 @@ router.get("/campaigns/:id/status", requireAuth, async (req, res) => {
     prisma.campaignMessage.count({
       where: { ownerId: req.user.id, campaignId: id, status: "failed" },
     }),
+    prisma.campaignMessage.count({
+      where: { ownerId: req.user.id, campaignId: id, status: "delivered" },
+    }),
   ]);
 
-  res.json({ campaign: c, metrics: { queued, sent, failed } });
+  res.json({ campaign: c, metrics: { queued, sent, delivered, failed } });
 });
 
 /* =========================================================
@@ -328,6 +331,91 @@ router.post("/campaigns/:id/fake-send", requireAuth, async (req, res) => {
   }
 
   res.json({ updated: ids.length, remainingQueued });
+});
+
+// PUT /api/campaigns/:id
+router.put("/campaigns/:id", requireAuth, async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    const { name, templateId, listId, scheduledAt } = req.body;
+
+    const campaign = await prisma.campaign.findFirst({
+      where: { id, ownerId: req.user.id },
+    });
+    if (!campaign) return res.status(404).json({ message: "Not found" });
+    if (["sending"].includes(campaign.status))
+      return res.status(409).json({ message: "Cannot edit while sending" });
+
+    const data = {};
+
+    if (typeof name !== "undefined") data.name = name;
+
+    if (typeof templateId !== "undefined") {
+      const tpl = await prisma.messageTemplate.findFirst({
+        where: { id: Number(templateId), ownerId: req.user.id },
+      });
+      if (!tpl) return res.status(404).json({ message: "template not found" });
+      data.templateId = Number(templateId);
+    }
+
+    if (typeof listId !== "undefined") {
+      const lst = await prisma.list.findFirst({
+        where: { id: Number(listId), ownerId: req.user.id },
+      });
+      if (!lst) return res.status(404).json({ message: "list not found" });
+      data.listId = Number(listId);
+    }
+
+    if (typeof scheduledAt !== "undefined") {
+      if (scheduledAt) {
+        data.scheduledAt = new Date(scheduledAt);
+        data.status = "scheduled";
+        try {
+          await schedulerQueue?.remove(`campaign:schedule:${id}`);
+        } catch (_) {}
+        const delay = Math.max(0, new Date(scheduledAt) - Date.now());
+        await schedulerQueue?.add(
+          "enqueueCampaign",
+          { campaignId: id },
+          {
+            delay,
+            jobId: `campaign:schedule:${id}`,
+          }
+        );
+      } else if (campaign.status === "scheduled") {
+        try {
+          await schedulerQueue?.remove(`campaign:schedule:${id}`);
+        } catch (_) {}
+        data.scheduledAt = null;
+        data.status = "draft";
+      }
+    }
+
+    const updated = await prisma.campaign.update({ where: { id }, data });
+    res.json(updated);
+  } catch (e) {
+    next(e);
+  }
+});
+
+// DELETE /api/campaigns/:id
+router.delete("/campaigns/:id", requireAuth, async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    const c = await prisma.campaign.findFirst({
+      where: { id, ownerId: req.user.id },
+    });
+    if (!c) return res.status(404).json({ message: "Not found" });
+    if (["sending"].includes(c.status))
+      return res.status(409).json({ message: "Cannot delete while sending" });
+    if (c.status === "scheduled") {
+      await schedulerQueue?.remove(`campaign:schedule:${id}`);
+    }
+    await prisma.campaign.delete({ where: { id } });
+    res.json({ ok: true });
+  } catch (e) {
+    next(e);
+  }
 });
 
 module.exports = router;

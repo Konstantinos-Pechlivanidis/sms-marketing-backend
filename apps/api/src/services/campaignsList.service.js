@@ -1,45 +1,20 @@
-const { PrismaClient } = require('@prisma/client');
-const prisma = new PrismaClient();
+// apps/api/src/services/campaignsList.service.js
+const prisma = require('../lib/prisma');
 
 function rate(numer, denom) {
   return denom > 0 ? Number((numer / denom).toFixed(4)) : 0;
 }
 
-/**
- * List campaigns for a specific owner, with optional aggregated KPIs.
- *
- * @param {Object} params
- * @param {number} params.ownerId            // << REQUIRED for scoping
- * @param {number} [params.page=1]
- * @param {number} [params.pageSize=10]
- * @param {string} [params.q]
- * @param {string} [params.status]
- * @param {string} [params.dateFrom]
- * @param {string} [params.dateTo]
- * @param {string} [params.orderBy='createdAt']  // createdAt|scheduledAt|startedAt|finishedAt|name|status
- * @param {string} [params.order='desc']         // asc|desc
- * @param {boolean} [params.withStats=true]
- */
 exports.listCampaigns = async ({
-  ownerId,                           // << NEW (required)
-  page = 1,
-  pageSize = 10,
-  q,
-  status,
-  dateFrom,
-  dateTo,
-  orderBy = 'createdAt',
-  order = 'desc',
-  withStats = true
+  ownerId, page = 1, pageSize = 10, q, status, dateFrom, dateTo,
+  orderBy = 'createdAt', order = 'desc', withStats = true
 }) => {
   if (!ownerId) throw new Error('ownerId is required');
 
   page = Math.max(1, Number(page));
   pageSize = Math.min(100, Math.max(1, Number(pageSize)));
 
-  // Base scope per owner
   const where = { ownerId };
-
   if (q) where.name = { contains: q, mode: 'insensitive' };
   if (status) where.status = status;
   if (dateFrom || dateTo) {
@@ -56,51 +31,39 @@ exports.listCampaigns = async ({
       skip: (page - 1) * pageSize,
       take: pageSize,
       select: {
-        id: true,
-        name: true,
-        status: true,
-        createdAt: true,
-        scheduledAt: true,
-        startedAt: true,
-        finishedAt: true
+        id: true, name: true, status: true,
+        createdAt: true, scheduledAt: true, startedAt: true, finishedAt: true
       }
     })
   ]);
 
-  if (!withStats || campaigns.length === 0) {
-    return { total, items: campaigns };
-  }
+  if (!withStats || campaigns.length === 0) return { total, items: campaigns };
 
   const ids = campaigns.map(c => c.id);
 
-  // Aggregations scoped by ownerId
   const msgs = await prisma.campaignMessage.groupBy({
     by: ['campaignId', 'status'],
-    where: { ownerId, campaignId: { in: ids } },   // << SCOPE
+    where: { ownerId, campaignId: { in: ids } },
     _count: { _all: true }
   });
 
   const reds = await prisma.redemption.groupBy({
     by: ['campaignId'],
-    where: { ownerId, campaignId: { in: ids } },   // << SCOPE
+    where: { ownerId, campaignId: { in: ids } },
     _count: { _all: true }
   });
 
-  const statsMap = new Map();
-  for (const id of ids) statsMap.set(id, { sent: 0, delivered: 0, failed: 0, redemptions: 0 });
-
+  const statsMap = new Map(ids.map(id => [id, { sent:0, delivered:0, failed:0, redemptions:0 }]));
   for (const row of msgs) {
     const s = statsMap.get(row.campaignId);
     if (row.status === 'delivered') s.delivered += row._count._all;
     if (row.status === 'failed') s.failed += row._count._all;
-    if (['sent', 'delivered', 'failed'].includes(row.status)) s.sent += row._count._all;
+    if (['sent','delivered','failed'].includes(row.status)) s.sent += row._count._all;
   }
-  for (const row of reds) {
-    statsMap.get(row.campaignId).redemptions = row._count._all;
-  }
+  for (const row of reds) statsMap.get(row.campaignId).redemptions = row._count._all;
 
   const items = campaigns.map(c => {
-    const s = statsMap.get(c.id) || { sent:0, delivered:0, failed:0, redemptions:0 };
+    const s = statsMap.get(c.id);
     return {
       ...c,
       stats: {

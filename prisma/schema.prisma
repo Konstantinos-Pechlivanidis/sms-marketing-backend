@@ -1,3 +1,5 @@
+// prisma/schema.prisma
+
 generator client {
   provider = "prisma-client-js"
 }
@@ -8,11 +10,21 @@ datasource db {
   directUrl = env("DIRECT_DATABASE_URL") // direct — migrations
 }
 
+/**
+ * =========================
+ * Bootstrap / housekeeping
+ * =========================
+ */
 model Bootstrap {
   id        Int      @id @default(autoincrement())
   createdAt DateTime @default(now())
 }
 
+/**
+ * =========================
+ * Users & auth
+ * =========================
+ */
 model User {
   id           Int      @id @default(autoincrement())
   email        String   @unique
@@ -20,14 +32,14 @@ model User {
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
+  // Optional profile
+  senderName String? @db.VarChar(11) // SMS sender (3–11 alphanumeric)
+  company    String? @db.VarChar(160)
+
   // Auth tokens
   tokens RefreshToken[]
 
-  // Optional profile
-  senderName String? @db.VarChar(11) // default SMS sender (3-11 alphanumeric)
-  company    String? @db.VarChar(160)
-
-  // Back-relations (named where needed)
+  // Back-relations
   ownedCampaigns    Campaign[]          @relation("CampaignOwner")
   createdCampaigns  Campaign[]          @relation("CampaignCreator")
   contacts          Contact[]
@@ -38,6 +50,7 @@ model User {
   Wallet            Wallet?
   CreditTransaction CreditTransaction[]
   Purchase          Purchase[]
+  automations       Automation[]        @relation("UserAutomations")
 }
 
 model RefreshToken {
@@ -52,6 +65,11 @@ model RefreshToken {
   @@index([userId])
 }
 
+/**
+ * =========================
+ * Contacts & lists
+ * =========================
+ */
 model Contact {
   id Int @id @default(autoincrement())
 
@@ -59,7 +77,8 @@ model Contact {
   ownerId Int
   owner   User @relation(fields: [ownerId], references: [id], onDelete: Cascade)
 
-  phone     String
+  // Store E.164; 15 max digits + '+' fits in 20 chars
+  phone     String   @db.VarChar(20)
   email     String?  @db.VarChar(320)
   firstName String?  @db.VarChar(120)
   lastName  String?  @db.VarChar(120)
@@ -112,6 +131,11 @@ model ListMembership {
   @@index([listId])
 }
 
+/**
+ * =========================
+ * Campaigns & templates
+ * =========================
+ */
 enum CampaignStatus {
   draft
   scheduled
@@ -173,6 +197,11 @@ model Campaign {
   @@index([ownerId])
 }
 
+/**
+ * =========================
+ * Messages & tracking
+ * =========================
+ */
 enum MessageStatus {
   queued
   sent
@@ -214,6 +243,7 @@ model CampaignMessage {
   @@index([status])
   @@index([providerMessageId])
   @@index([ownerId])
+  @@index([campaignId, status]) // for quick "any queued left?" checks
 }
 
 model Redemption {
@@ -227,6 +257,11 @@ model Redemption {
   ownerId Int
   owner   User @relation(fields: [ownerId], references: [id], onDelete: Cascade)
 
+  // NEW: visit counters for offer/QR page
+  visits        Int       @default(0)
+  lastVisitedAt DateTime?
+
+  // keep existing redemption moment (if you confirm a one-time redeem)
   redeemedAt       DateTime @default(now())
   redeemedByUserId Int?
   evidenceJson     Json?
@@ -236,6 +271,11 @@ model Redemption {
   @@index([ownerId])
 }
 
+/**
+ * =========================
+ * Webhooks audit
+ * =========================
+ */
 model WebhookEvent {
   id                Int      @id @default(autoincrement())
   provider          String
@@ -248,6 +288,11 @@ model WebhookEvent {
   @@index([providerMessageId])
 }
 
+/**
+ * =========================
+ * Billing (wallet, purchases)
+ * =========================
+ */
 enum PaymentStatus {
   pending
   paid
@@ -315,4 +360,25 @@ model Purchase {
 
   @@index([ownerId])
   @@index([packageId])
+}
+
+/**
+ * =========================
+ * Automations MVP
+ * =========================
+ */
+model Automation {
+  id        Int      @id @default(autoincrement())
+  ownerId   Int
+  title     String
+  message   String
+  isActive  Boolean  @default(false)
+  trigger   String // e.g. 'birthday', 'welcome', 'winback'
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  owner User @relation("UserAutomations", fields: [ownerId], references: [id], onDelete: Cascade)
+
+  @@index([ownerId, isActive])
+  @@index([ownerId, trigger])
 }

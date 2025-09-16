@@ -1,22 +1,25 @@
 openapi: 3.0.3
 info:
   title: SMS Blossom Marketing Suite API
-  version: 1.0.0
+  version: 1.1.0
   description: |
     Backend API for SMS campaign management, tracking (QR/unsubscribe), billing/credits and job processing.
     - Auth uses Bearer **access tokens**. Refresh happens via **httpOnly cookie** (name `rt`), not via Authorization header.
-    - Public endpoints: `/tracking/*`, `/webhooks/*` (HMAC-verified), `/health`.
+    - Public endpoints: `/tracking/*`, `/api/tracking/offer/*`, `/api/unsubscribe`, `/webhooks/*` (HMAC-verified), `/health`.
 servers:
   - url: http://localhost:3001
     description: Local dev
 
 tags:
   - name: Auth
+  - name: User
   - name: Contacts
   - name: Lists
   - name: Templates
   - name: Campaigns
   - name: Campaign Stats
+  - name: Dashboard
+  - name: Automations
   - name: Tracking
   - name: Billing
   - name: Jobs
@@ -47,12 +50,30 @@ components:
         email: { type: string, format: email }
         senderName: { type: string, nullable: true }
         company: { type: string, nullable: true }
+    Me:
+      allOf:
+        - $ref: '#/components/schemas/User'
+        - type: object
+          properties:
+            credits: { type: integer, description: "Wallet balance snapshot" }
+    UpdateUser:
+      type: object
+      properties:
+        senderName: { type: string, nullable: true, description: "3–11 alphanumeric" }
+        company: { type: string, nullable: true }
+        name: { type: string, nullable: true }
+    ChangePassword:
+      type: object
+      required: [oldPassword, newPassword]
+      properties:
+        oldPassword: { type: string }
+        newPassword: { type: string }
     Contact:
       type: object
       properties:
         id: { type: integer }
         ownerId: { type: integer }
-        phone: { type: string }
+        phone: { type: string, description: "E.164 (+<cc><nsn>)" }
         email: { type: string, nullable: true }
         firstName: { type: string, nullable: true }
         lastName: { type: string, nullable: true }
@@ -87,6 +108,21 @@ components:
         startedAt: { type: string, format: date-time, nullable: true }
         finishedAt: { type: string, format: date-time, nullable: true }
         total: { type: integer }
+    CampaignCreate:
+      type: object
+      required: [name, templateId, listId]
+      properties:
+        name: { type: string }
+        templateId: { type: integer }
+        listId: { type: integer }
+        scheduledAt: { type: string, format: date-time, nullable: true }
+    CampaignUpdate:
+      type: object
+      properties:
+        name: { type: string }
+        templateId: { type: integer }
+        listId: { type: integer }
+        scheduledAt: { type: string, format: date-time, nullable: true, description: "Set to null to unschedule" }
     CampaignStatusSummary:
       type: object
       properties:
@@ -97,6 +133,7 @@ components:
           properties:
             queued: { type: integer }
             sent: { type: integer }
+            delivered: { type: integer }
             failed: { type: integer }
     CampaignStats:
       type: object
@@ -144,6 +181,28 @@ components:
         priceCents: { type: integer }
         status: { type: string, enum: [pending, paid, failed, refunded] }
         createdAt: { type: string, format: date-time }
+    KPI:
+      type: object
+      properties:
+        totalCampaigns: { type: integer }
+        totalMessages: { type: integer }
+        sent: { type: integer }
+        delivered: { type: integer }
+        failed: { type: integer }
+        deliveredRate: { type: number }
+        conversion: { type: integer }
+        conversionRate: { type: number }
+    Automation:
+      type: object
+      properties:
+        id: { type: integer }
+        ownerId: { type: integer }
+        title: { type: string }
+        message: { type: string }
+        isActive: { type: boolean }
+        trigger: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
 
 security:
   - bearerAuth: []
@@ -169,7 +228,7 @@ paths:
         '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/User' } } } }
         '400': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
-      security: []  # public
+      security: []
 
   /api/auth/login:
     post:
@@ -201,7 +260,7 @@ paths:
                   user: { $ref: '#/components/schemas/User' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
-      security: []  # public
+      security: []
 
   /api/auth/refresh:
     post:
@@ -219,7 +278,7 @@ paths:
                   user: { $ref: '#/components/schemas/User' }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '429': { $ref: '#/components/responses/TooManyRequests' }
-      security: []  # public; relies on cookie
+      security: []
 
   /api/auth/logout:
     post:
@@ -227,14 +286,45 @@ paths:
       summary: Logout and clear refresh cookie
       responses:
         '200': { description: OK }
-      security: []  # public; relies on cookie
+      security: []
 
   /api/me:
     get:
-      tags: [Auth]
-      summary: Get current user (requires Bearer)
+      tags: [User]
+      summary: Get current user + credits
       responses:
-        '200': { description: OK, content: { application/json: { schema: { type: object, properties: { user: { $ref: '#/components/schemas/User' } } } } } }
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Me' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/user:
+    put:
+      tags: [User]
+      summary: Update profile (senderName/company/name)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/UpdateUser' }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/User' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/user/password:
+    put:
+      tags: [User]
+      summary: Change password
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ChangePassword' }
+      responses:
+        '200': { description: OK }
+        '400': { description: Invalid current password }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
   /api/contacts:
@@ -242,10 +332,18 @@ paths:
       tags: [Contacts]
       summary: List contacts (paginated)
       parameters:
-        - in: query; name: page; schema: { type: integer, default: 1 }
-        - in: query; name: pageSize; schema: { type: integer, default: 20 }
-        - in: query; name: q; schema: { type: string }
-        - in: query; name: isSubscribed; schema: { type: string, enum: [true, false] }
+        - in: query
+          name: page
+          schema: { type: integer, default: 1 }
+        - in: query
+          name: pageSize
+          schema: { type: integer, default: 20 }
+        - in: query
+          name: q
+          schema: { type: string }
+        - in: query
+          name: isSubscribed
+          schema: { type: string, enum: [true, false] }
       responses:
         '200': { description: OK }
         '401': { $ref: '#/components/responses/Unauthorized' }
@@ -260,7 +358,7 @@ paths:
               type: object
               required: [phone]
               properties:
-                phone: { type: string }
+                phone: { type: string, description: "E.164 (+<cc><nsn>)" }
                 email: { type: string }
                 firstName: { type: string }
                 lastName: { type: string }
@@ -334,7 +432,7 @@ paths:
       parameters: [ { in: path, name: listId, required: true, schema: { type: integer } } ]
       responses:
         '200': { description: OK }
-        '401': { $ref: '#/components/responses/Unauthorized' }
+      security: []
 
   /api/lists/{listId}/contacts/{contactId}:
     post:
@@ -387,8 +485,18 @@ paths:
       tags: [Campaigns]
       summary: List campaigns (paginated)
       parameters:
-        - in: query; name: take; schema: { type: integer, default: 20 }
-        - in: query; name: skip; schema: { type: integer, default: 0 }
+        - in: query
+          name: page
+          schema: { type: integer, default: 1 }
+        - in: query
+          name: pageSize
+          schema: { type: integer, default: 20 }
+        - in: query
+          name: q
+          schema: { type: string }
+        - in: query
+          name: status
+          schema: { type: string, enum: [draft, scheduled, sending, paused, completed, failed] }
       responses:
         '200': { description: OK }
         '401': { $ref: '#/components/responses/Unauthorized' }
@@ -399,14 +507,7 @@ paths:
         required: true
         content:
           application/json:
-            schema:
-              type: object
-              required: [name, templateId, listId]
-              properties:
-                name: { type: string }
-                templateId: { type: integer }
-                listId: { type: integer }
-                scheduledAt: { type: string, format: date-time }
+            schema: { $ref: '#/components/schemas/CampaignCreate' }
       responses:
         '201': { description: Created, content: { application/json: { schema: { $ref: '#/components/schemas/Campaign' } } } }
         '401': { $ref: '#/components/responses/Unauthorized' }
@@ -417,9 +518,32 @@ paths:
       summary: Get campaign
       parameters: [ { in: path, name: id, required: true, schema: { type: integer } } ]
       responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Campaign' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    put:
+      tags: [Campaigns]
+      summary: Update campaign (name/template/list/schedule)
+      parameters: [ { in: path, name: id, required: true, schema: { type: integer } } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CampaignUpdate' }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Campaign' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Cannot edit while sending }
+    delete:
+      tags: [Campaigns]
+      summary: Delete campaign (not while sending)
+      parameters: [ { in: path, name: id, required: true, schema: { type: integer } } ]
+      responses:
         '200': { description: OK }
         '401': { $ref: '#/components/responses/Unauthorized' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409': { description: Cannot delete while sending }
 
   /api/campaigns/{id}/preview:
     get:
@@ -446,7 +570,11 @@ paths:
       summary: Lightweight status metrics
       parameters: [ { in: path, name: id, required: true, schema: { type: integer } } ]
       responses:
-        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/CampaignStatusSummary' } } } }
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CampaignStatusSummary' }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
   /api/v1/campaigns/stats:
@@ -454,7 +582,9 @@ paths:
       tags: [Campaign Stats]
       summary: Bulk stats by IDs
       parameters:
-        - in: query; name: ids; schema: { type: string, example: "1,2,3" }
+        - in: query
+          name: ids
+          schema: { type: string, example: "1,2,3" }
       responses:
         '200': { description: OK }
         '401': { $ref: '#/components/responses/Unauthorized' }
@@ -465,8 +595,80 @@ paths:
       summary: Stats for one campaign
       parameters: [ { in: path, name: id, required: true, schema: { type: integer } } ]
       responses:
-        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/CampaignStats' } } } }
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CampaignStats' }
         '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/dashboard/kpis:
+    get:
+      tags: [Dashboard]
+      summary: KPI cards data
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/KPI' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+
+  /api/automations:
+    get:
+      tags: [Automations]
+      summary: List automations
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { type: array, items: { $ref: '#/components/schemas/Automation' } } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /api/automations/{id}:
+    put:
+      tags: [Automations]
+      summary: Update automation (title/message/trigger)
+      parameters: [ { in: path, name: id, required: true, schema: { type: integer } } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                title: { type: string }
+                message: { type: string }
+                trigger: { type: string }
+      responses:
+        '200': { description: OK, content: { application/json: { schema: { $ref: '#/components/schemas/Automation' } } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/automations/{id}/status:
+    put:
+      tags: [Automations]
+      summary: Enable/disable automation
+      parameters: [ { in: path, name: id, required: true, schema: { type: integer } } ]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [isActive]
+              properties:
+                isActive: { type: boolean }
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id: { type: integer }
+                  isActive: { type: boolean }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/NotFound' }
 
   /tracking/redeem/{trackingId}:
     get:
@@ -476,7 +678,7 @@ paths:
       responses:
         '200': { description: OK }
         '404': { $ref: '#/components/responses/NotFound' }
-      security: []  # public
+      security: []
 
   /tracking/redeem:
     post:
@@ -491,6 +693,38 @@ paths:
         '200': { description: OK }
         '401': { $ref: '#/components/responses/Unauthorized' }
 
+  /api/tracking/offer/{trackingId}:
+    get:
+      tags: [Tracking]
+      summary: Public offer/scan view payload + visit counter
+      parameters: [ { in: path, name: trackingId, required: true, schema: { type: string } } ]
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  trackingId: { type: string }
+                  storeName: { type: string }
+                  offerText: { type: string }
+        '404': { $ref: '#/components/responses/NotFound' }
+      security: []
+
+  /api/unsubscribe:
+    post:
+      tags: [Tracking]
+      summary: Public unsubscribe by token/code (idempotent)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [code], properties: { code: { type: string } } }
+      responses:
+        '200': { description: OK }
+      security: []
+
   /api/billing/balance:
     get:
       tags: [Billing]
@@ -504,8 +738,12 @@ paths:
       tags: [Billing]
       summary: List credit transactions (paginated)
       parameters:
-        - in: query; name: page; schema: { type: integer, default: 1 }
-        - in: query; name: pageSize; schema: { type: integer, default: 10 }
+        - in: query
+          name: page
+          schema: { type: integer, default: 1 }
+        - in: query
+          name: pageSize
+          schema: { type: integer, default: 10 }
       responses:
         '200': { description: OK }
         '401': { $ref: '#/components/responses/Unauthorized' }
@@ -522,6 +760,12 @@ paths:
     post:
       tags: [Billing]
       summary: Purchase a package (MVP marks as paid and credits wallet)
+      parameters:
+        - in: header
+          name: Idempotency-Key
+          required: true
+          schema: { type: string }
+          description: Prevents duplicate purchases on retries/double-click
       requestBody:
         required: true
         content:
@@ -529,7 +773,9 @@ paths:
             schema: { type: object, required: [packageId], properties: { packageId: { type: integer } } }
       responses:
         '201': { description: Created }
+        '400': { description: Idempotency-Key header required }
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
 
   /api/jobs/health:
     get:
@@ -545,7 +791,7 @@ paths:
       summary: Delivery reports (HMAC verified)
       responses:
         '202': { description: Accepted }
-      security: []  # provider calls
+      security: []
 
   /webhooks/mitto/inbound:
     post:
@@ -553,4 +799,4 @@ paths:
       summary: Inbound messages (STOP detection, HMAC verified)
       responses:
         '202': { description: Accepted }
-      security: []  # provider calls
+      security: []

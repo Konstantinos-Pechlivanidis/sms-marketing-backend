@@ -6,7 +6,7 @@ function rate(numer, denom) {
 }
 
 exports.listCampaigns = async ({
-  ownerId, page = 1, pageSize = 10, q, status, dateFrom, dateTo,
+  ownerId, page = 1, pageSize = 20, q, status, dateFrom, dateTo,
   orderBy = 'createdAt', order = 'desc', withStats = true
 }) => {
   if (!ownerId) throw new Error('ownerId is required');
@@ -56,11 +56,15 @@ exports.listCampaigns = async ({
   const statsMap = new Map(ids.map(id => [id, { sent:0, delivered:0, failed:0, redemptions:0 }]));
   for (const row of msgs) {
     const s = statsMap.get(row.campaignId);
+    if (!s) continue;
     if (row.status === 'delivered') s.delivered += row._count._all;
     if (row.status === 'failed') s.failed += row._count._all;
     if (['sent','delivered','failed'].includes(row.status)) s.sent += row._count._all;
   }
-  for (const row of reds) statsMap.get(row.campaignId).redemptions = row._count._all;
+  for (const row of reds) {
+    const s = statsMap.get(row.campaignId);
+    if (s) s.redemptions = row._count._all;
+  }
 
   const items = campaigns.map(c => {
     const s = statsMap.get(c.id);

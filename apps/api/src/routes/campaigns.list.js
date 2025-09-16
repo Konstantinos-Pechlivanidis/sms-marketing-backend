@@ -1,55 +1,47 @@
-const { Router } = require('express');
+// apps/api/src/routes/campaigns.list.js
+const express = require('express');
 const requireAuth = require('../middleware/requireAuth');
 const { listCampaigns } = require('../services/campaignsList.service');
-// optional tiny cache (no-op if REDIS_URL not set, per your wrapper)
-const { cacheGet, cacheSet } = require('../lib/cache');
 
-const r = Router();
+const router = express.Router();
+router.use(requireAuth);
 
-// GET /campaigns
-r.get('/campaigns', requireAuth, async (req, res, next) => {
+/**
+ * GET /api/v1/campaigns
+ * Query:
+ *  - page=1
+ *  - pageSize=20
+ *  - q (search by name)
+ *  - status (draft|scheduled|sending|paused|completed|failed)
+ *  - dateFrom, dateTo (ISO)
+ *  - orderBy (createdAt|startedAt|finishedAt), order (asc|desc)
+ *  - withStats=true|false
+ */
+router.get('/campaigns', async (req, res, next) => {
   try {
     const {
-      page, pageSize, q, status, dateFrom, dateTo, orderBy, order, withStats
-    } = req.query;
-
-    const ownerId = req.user.id; // << SCOPE (1 user = 1 store)
-
-    const safeOrderBy = ['createdAt','scheduledAt','startedAt','finishedAt','name','status'].includes(orderBy)
-      ? orderBy : 'createdAt';
-    const safeOrder = (order === 'asc' || order === 'desc') ? order : 'desc';
-    const wantStats = String(withStats ?? 'true') !== 'false';
-
-    // Optional cache key (short TTL)
-    const key = `campaigns:list:v1:${ownerId}:${page||1}:${pageSize||10}:${q||''}:${status||''}:${dateFrom||''}:${dateTo||''}:${safeOrderBy}:${safeOrder}:${wantStats}`;
-    const cached = await cacheGet(key);
-    if (cached) return res.json(JSON.parse(cached));
-
-    const out = await listCampaigns({
-      ownerId,               // << pass owner scope to service
-      page,
-      pageSize,
+      page = 1,
+      pageSize = 20,
       q,
       status,
       dateFrom,
       dateTo,
-      orderBy: safeOrderBy,
-      order: safeOrder,
-      withStats: wantStats
+      orderBy = 'createdAt',
+      order = 'desc',
+      withStats = 'true'
+    } = req.query;
+
+    const result = await listCampaigns({
+      ownerId: req.user.id,
+      page, pageSize, q, status, dateFrom, dateTo,
+      orderBy, order,
+      withStats: String(withStats).toLowerCase() !== 'false'
     });
 
-    const payload = {
-      page: Number(page || 1),
-      pageSize: Number(pageSize || 10),
-      total: out.total,
-      items: out.items
-    };
-
-    // Short TTL to reduce DB pressure on dashboards
-    await cacheSet(key, JSON.stringify(payload), 20);
-
-    res.json(payload);
-  } catch (e) { next(e); }
+    res.json(result);
+  } catch (e) {
+    next(e);
+  }
 });
 
-module.exports = r;
+module.exports = router;

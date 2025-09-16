@@ -1,121 +1,150 @@
 // apps/api/src/services/campaignEnqueue.service.js
-const prisma = require('../lib/prisma');
-const { debit } = require('./wallet.service');
 const crypto = require('node:crypto');
+const { Queue } = require('bullmq');
+const IORedis = require('ioredis');
+const prisma = require('../lib/prisma');
+const { debit } = require('../services/wallet.service'); // assumes you have debit(); you already use refund() in worker
 
-function render(templateText, contact) {
-  return (templateText || '')
-    .replace(/{{\s*firstName\s*}}/gi, contact.firstName || '')
-    .replace(/{{\s*lastName\s*}}/gi, contact.lastName || '')
-    .replace(/{{\s*email\s*}}/gi, contact.email || '');
+// Reuse Redis from env (same as worker)
+const url = process.env.REDIS_URL || 'redis://localhost:6379';
+const connection = new IORedis(url, { maxRetriesPerRequest: null });
+connection.on('error', (e) => console.warn('[Redis] producer connection error:', e.message));
+
+const smsQueue = new Queue('smsQueue', { connection });
+
+function renderText(text, contact) {
+  return String(text || '')
+    .replace(/\{\{firstName\}\}/g, contact.firstName || '')
+    .replace(/\{\{lastName\}\}/g, contact.lastName || '')
+    .replace(/\{\{email\}\}/g, contact.email || '');
 }
+
+// simple unique token for trackingId
 function newTrackingId() {
-  return crypto.randomBytes(9).toString('base64url');
+  return crypto.randomBytes(12).toString('hex'); // 24 chars
 }
 
-exports.enqueueCampaign = async (campaignId) => {
-  // 1) Transaction for status lock + members + messages
-  const txResult = await prisma.$transaction(async (tx) => {
-    const camp = await tx.campaign.findUnique({
-      where: { id: campaignId },
-      include: { template: true }
-    });
-    if (!camp) return { ok: false, reason: 'not_found' };
-
-    if (!['draft', 'scheduled', 'paused'].includes(camp.status)) {
-      return { ok: false, reason: `invalid_status:${camp.status}` };
+/**
+ * Enqueue a campaign:
+ *  - Validates campaign is owned by someone and is enqueueable
+ *  - Builds recipient set from the campaign's list (subscribed contacts only)
+ *  - Debits wallet atomically for N credits
+ *  - Creates N CampaignMessage rows
+ *  - Adds N jobs to BullMQ (payload: { messageId })
+ */
+async function enqueueCampaign(campaignId) {
+  const campaign = await prisma.campaign.findUnique({
+    where: { id: Number(campaignId) },
+    include: {
+      template: true,
+      list: {
+        include: {
+          memberships: {
+            include: { contact: true }
+          }
+        }
+      }
     }
-
-    const upd = await tx.campaign.updateMany({
-      where: { id: campaignId, status: { in: ['draft', 'scheduled', 'paused'] } },
-      data: { status: 'sending', startedAt: new Date() }
-    });
-    if (upd.count === 0) {
-      return { ok: false, reason: 'already_sending' };
-    }
-
-    const members = await tx.listMembership.findMany({
-      where: { listId: camp.listId, contact: { isSubscribed: true } },
-      include: { contact: true }
-    });
-
-    if (!members.length) {
-      await tx.campaign.update({
-        where: { id: camp.id },
-        data: { status: 'failed', finishedAt: new Date(), total: 0 }
-      });
-      return { ok: false, reason: 'no_recipients' };
-    }
-
-    // ==== debit credits here (outside of this tx to avoid nested tx issues) ====
-    // We cannot call debit() inside this tx (it uses its own $transaction). So we return needed info.
-    return {
-      ok: true,
-      _needsDebit: { ownerId: camp.ownerId, amount: members.length, campaignId: camp.id },
-      _camp: camp,
-      _members: members
-    };
   });
 
-  if (!txResult.ok) return { ...txResult, enqueuedJobs: 0 };
+  if (!campaign) return { ok: false, reason: 'not_found' };
 
-  // 2) Perform debit (credits) now. If insufficient -> revert campaign to 'draft'.
-  const { ownerId, amount, campaignId: campId } = txResult._needsDebit;
-  try {
-    await debit(ownerId, amount, { reason: `enqueue:campaign:${campId}`, campaignId: campId });
-  } catch (e) {
-    // revert campaign status if debit failed
-    await prisma.campaign.update({
-      where: { id: campId },
-      data: { status: 'draft', startedAt: null }
-    });
-    if (e.message === 'INSUFFICIENT_CREDITS') {
-      return { ok: false, reason: 'insufficient_credits' };
-    }
-    throw e;
+  if (!['draft', 'scheduled', 'paused'].includes(campaign.status)) {
+    return { ok: false, reason: 'not_enqueueable' };
   }
 
-  // 3) Create messages and set totals
-  const camp = txResult._camp;
-  const members = txResult._members;
+  // Build recipients: subscribed, has phone
+  const contacts = campaign.list.memberships
+    .map(m => m.contact)
+    .filter(c => c?.isSubscribed && c?.phone);
 
-  const messagesData = members.map((m) => ({
-    ownerId,
-    campaignId: camp.id,
-    contactId: m.contactId,
-    to: m.contact.phone,
-    text: render(camp.template.text, m.contact),
-    trackingId: newTrackingId(),
-    status: 'queued'
-  }));
+  // Unique by contactId (defensive)
+  const seen = new Set();
+  const recipients = [];
+  for (const c of contacts) {
+    if (!seen.has(c.id)) {
+      seen.add(c.id);
+      recipients.push(c);
+    }
+  }
 
-  await prisma.$transaction([
-    prisma.campaign.update({
-      where: { id: camp.id },
-      data: { total: members.length }
-    }),
-    prisma.campaignMessage.createMany({
-      data: messagesData,
-      skipDuplicates: true
-    })
-  ]);
+  if (recipients.length === 0) {
+    return { ok: false, reason: 'no_valid_recipients' };
+  }
 
-  // 4) Enqueue jobs
-  const smsQueue = require('../queues/sms.queue');
-  const toEnqueue = await prisma.campaignMessage.findMany({
-    where: { campaignId: camp.id, status: 'queued', providerMessageId: null },
-    select: { id: true }
+  const now = new Date();
+
+  // All-or-nothing: debit credits, flip campaign to sending, create messages
+  // We avoid createMany -> no IDs returned; we want IDs for queue jobs.
+  // Chunk inserts to keep memory stable for large lists.
+  const CHUNK = 500;
+
+  const result = await prisma.$transaction(async (tx) => {
+    // 1) Debit credits
+    await debit(campaign.ownerId, recipients.length, {
+      reason: `enqueue:campaign:${campaign.id}`,
+      campaignId: campaign.id
+    });
+
+    // 2) Update campaign -> sending
+    await tx.campaign.update({
+      where: { id: campaign.id },
+      data: {
+        status: 'sending',
+        startedAt: now,
+        total: recipients.length,
+        // when enqueuing a previously scheduled campaign, clear scheduledAt
+        scheduledAt: null
+      }
+    });
+
+    // 3) Create messages (in chunks), queue jobs
+    let createdCount = 0;
+
+    for (let i = 0; i < recipients.length; i += CHUNK) {
+      const slice = recipients.slice(i, i + CHUNK);
+
+      // Insert one-by-one to get IDs immediately (OK for MVP; chunked to reduce round-trips)
+      const createdIds = [];
+      for (const contact of slice) {
+        const text = renderText(campaign.template.text, contact);
+        const trackingId = newTrackingId();
+
+        const msg = await tx.campaignMessage.create({
+          data: {
+            ownerId: campaign.ownerId,
+            campaignId: campaign.id,
+            contactId: contact.id,
+            to: contact.phone,   // already normalized to E.164 by contacts API
+            text,
+            trackingId,
+            status: 'queued'
+          },
+          select: { id: true }
+        });
+
+        createdIds.push(msg.id);
+      }
+
+      // Queue jobs for this chunk
+      const jobs = createdIds.map((id) => ({
+        name: 'send',
+        data: { messageId: id },
+        opts: { removeOnComplete: 1000, removeOnFail: 5000 }
+      }));
+      await smsQueue.addBulk(jobs);
+
+      createdCount += createdIds.length;
+    }
+
+    return { createdCount };
   });
 
-  let enqueuedJobs = 0;
-  if (smsQueue) {
-    for (const m of toEnqueue) {
-      await smsQueue.add('sendSMS', { messageId: m.id }, { jobId: `message:${m.id}` });
-      enqueuedJobs++;
-    }
-  } else {
-    console.warn('[Queue] Not available — messages created but not enqueued');
-  }
+  return {
+    ok: true,
+    total: recipients.length,
+    enqueued: result.createdCount
+  };
+}
 
-  return { ok: true, created: messagesData.length, enqueuedJobs, campaignId: camp.id };
-};
+module.exports = { enqueueCampaign };

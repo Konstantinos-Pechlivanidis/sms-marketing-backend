@@ -36,23 +36,30 @@ exports.getCampaignStats = async (campaignId, ownerId) => {
     prisma.redemption.count({ where: { ownerId, campaignId } })
   ]);
 
-  const recipients = await prisma.campaignMessage.groupBy({
-    by: ['contactId'],
-    where: { ownerId, campaignId }
-  });
-  const recipientIds = recipients.map(r => r.contactId);
-
+  // recipients who later unsubscribed, starting from first sent timestamp
   const firstSentAt = await getFirstSentAt(campaignId, ownerId);
-
   let unsubscribes = 0;
-  if (recipientIds.length && firstSentAt) {
-    unsubscribes = await prisma.contact.count({
-      where: { ownerId, id: { in: recipientIds }, unsubscribedAt: { gte: firstSentAt } }
+  if (firstSentAt) {
+    const recipients = await prisma.campaignMessage.findMany({
+      where: { ownerId, campaignId },
+      select: { contactId: true },
+      distinct: ['contactId']
     });
+    const ids = recipients.map(r => r.contactId);
+    if (ids.length) {
+      unsubscribes = await prisma.contact.count({
+        where: { ownerId, id: { in: ids }, unsubscribedAt: { gte: firstSentAt } }
+      });
+    }
   }
 
   return {
-    sent, delivered, failed, redemptions, unsubscribes,
+    campaignId,
+    sent,
+    delivered,
+    failed,
+    redemptions,
+    unsubscribes,
     deliveredRate: rate(delivered, sent),
     conversionRate: rate(redemptions, delivered),
     firstSentAt
@@ -78,6 +85,7 @@ exports.getManyCampaignsStats = async (campaignIds, ownerId) => {
   const map = new Map(campaignIds.map(id => [id, { sent:0, delivered:0, failed:0, redemptions:0 }]));
   for (const row of msgs) {
     const entry = map.get(row.campaignId);
+    if (!entry) continue;
     if (row.status === 'delivered') entry.delivered += row._count._all;
     if (row.status === 'failed') entry.failed += row._count._all;
     if (['sent','delivered','failed'].includes(row.status)) entry.sent += row._count._all;

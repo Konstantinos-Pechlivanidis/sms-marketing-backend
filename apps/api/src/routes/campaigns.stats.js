@@ -1,46 +1,42 @@
-const { Router } = require('express');
+// apps/api/src/routes/campaigns.stats.js
+const express = require('express');
 const requireAuth = require('../middleware/requireAuth');
 const { getCampaignStats, getManyCampaignsStats } = require('../services/campaignStats.service');
-const { cacheGet, cacheSet } = require('../lib/cache');
 
-const r = Router();
+const router = express.Router();
+router.use(requireAuth);
 
-// GET /campaigns/:id/stats
-r.get('/campaigns/:id/stats', requireAuth, async (req, res, next) => {
+/**
+ * GET /api/v1/campaigns/stats?ids=1,2,3
+ */
+router.get('/campaigns/stats', async (req, res, next) => {
   try {
-    const id = Number(req.params.id);
-    if (!id) return res.status(400).json({ message: 'invalid id' });
+    const ids = String(req.query.ids || '')
+      .split(',')
+      .map(s => Number(s.trim()))
+      .filter(n => Number.isInteger(n) && n > 0);
 
-    const ownerId = req.user.id;
-    const key = `stats:campaign:v1:${ownerId}:${id}`;    // scoped cache key
+    if (!ids.length) return res.json([]);
 
-    const cached = await cacheGet(key);
-    if (cached) return res.json(JSON.parse(cached));
-
-    const stats = await getCampaignStats(id, ownerId);
-    const payload = { campaignId: id, ...stats };
-
-    await cacheSet(key, JSON.stringify(payload), 30);    // 30s TTL
-    res.json(payload);
+    const data = await getManyCampaignsStats(ids, req.user.id);
+    res.json(data);
   } catch (e) {
-    if (e?.code === 'NOT_FOUND') return res.status(404).json({ message: 'not found' });
     next(e);
   }
 });
 
-// (optional) GET /campaigns/stats?ids=1,2,3
-r.get('/campaigns/stats', requireAuth, async (req, res, next) => {
+/**
+ * GET /api/v1/campaigns/:id/stats
+ */
+router.get('/campaigns/:id/stats', async (req, res, next) => {
   try {
-    const ownerId = req.user.id;
-    const ids = (req.query.ids || '').toString()
-      .split(',').map(x => Number(x.trim())).filter(Boolean);
-
-    if (!ids.length) return res.json([]);
-
-    // You could add caching here with a combined key if needed
-    const arr = await getManyCampaignsStats(ids, ownerId);
-    res.json(arr);
-  } catch (e) { next(e); }
+    const id = Number(req.params.id);
+    const data = await getCampaignStats(id, req.user.id);
+    res.json(data);
+  } catch (e) {
+    if (e.code === 'NOT_FOUND') return res.status(404).json({ message: 'not found' });
+    next(e);
+  }
 });
 
-module.exports = r;
+module.exports = router;

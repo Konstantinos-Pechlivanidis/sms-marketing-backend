@@ -38,7 +38,7 @@ async function maybeCompleteCampaign(campaignId) {
   if (remaining === 0) {
     await prisma.campaign.update({
       where: { id: campaignId },
-      data: { status: 'completed', completedAt: new Date() }
+      data: { status: 'completed', finishedAt: new Date() }
     });
   }
 }

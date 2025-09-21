@@ -1,175 +1,128 @@
 // apps/api/src/services/campaignEnqueue.service.js
-const crypto = require('node:crypto');
 const prisma = require('../lib/prisma');
-const { debit } = require('../services/wallet.service');
+const { normalizeToE164, isE164 } = require('../lib/phone');
 
-// Optional BullMQ/Redis. We load lazily to avoid connection errors when disabled.
-let Queue, IORedis;
-try {
-  Queue = require('bullmq').Queue;
-  IORedis = require('ioredis');
-} catch (_) {
-  // bullmq/ioredis not installed — that's okay for QUEUE_DISABLED mode
-}
+const ALL_LIST_NAME = '[ALL_CONTACTS]';
 
-const QUEUE_DISABLED = process.env.QUEUE_DISABLED === '1';
-const REDIS_URL = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
-
-let smsQueue = null;
-let producerConn = null;
-let queueInitTried = false;
-
-async function getQueue() {
-  if (QUEUE_DISABLED) return null;
-  if (smsQueue || queueInitTried) return smsQueue;
-  queueInitTried = true;
-
-  // If deps are missing, bail quietly
-  if (!Queue || !IORedis) return null;
-
-  try {
-    // Basic sanity: if REDIS_URL is obviously unset, don't try
-    if (!REDIS_URL || !/^redis(s)?:\/\//i.test(REDIS_URL)) return null;
-
-    producerConn = new IORedis(REDIS_URL, { maxRetriesPerRequest: null });
-    producerConn.on('error', (e) => {
-      // Downgrade to debug-level: avoid noisy console in dev
-      console.debug('[Redis] producer connection issue:', e?.message);
-    });
-
-    smsQueue = new Queue('smsQueue', { connection: producerConn });
-    return smsQueue;
-  } catch (_) {
-    // Fail open: treat as no queue
-    smsQueue = null;
-    return null;
+// Helper: debit wallet (throws { status: 402 } on insufficient credits)
+async function debitCredits(ownerId, units, reason, meta) {
+  const wallet = await prisma.wallet.findUnique({ where: { ownerId } });
+  const balance = wallet?.balance ?? 0;
+  if (balance < units) {
+    const err = new Error('insufficient credits');
+    err.status = 402;
+    throw err;
   }
+  const newBal = balance - units;
+  const txn = await prisma.$transaction([
+    prisma.wallet.update({
+      where: { ownerId },
+      data: { balance: newBal }
+    }),
+    prisma.creditTransaction.create({
+      data: {
+        ownerId,
+        type: 'debit',
+        amount: units,
+        balanceAfter: newBal,
+        reason: reason || 'campaign enqueue',
+        meta: meta || null
+      }
+    })
+  ]);
+  return txn;
 }
 
-function renderText(text, contact) {
-  return String(text || '')
+// Render template with simple handlebars-like vars
+function renderText(templateText, contact) {
+  return templateText
     .replace(/\{\{firstName\}\}/g, contact.firstName || '')
     .replace(/\{\{lastName\}\}/g, contact.lastName || '')
     .replace(/\{\{email\}\}/g, contact.email || '');
 }
 
-function newTrackingId() {
-  return crypto.randomBytes(12).toString('hex'); // 24 chars
+function smsParts(len) {
+  if (len <= 160) return 1;
+  return Math.ceil(len / 153);
 }
 
-/**
- * Enqueue a campaign:
- *  - Validates enqueueable
- *  - Collects subscribed recipients
- *  - Debits credits atomically
- *  - Creates CampaignMessage rows (status=queued)
- *  - Tries to add BullMQ jobs (if queue available)
- */
-async function enqueueCampaign(campaignId) {
+exports.enqueueCampaign = async (campaignId) => {
   const campaign = await prisma.campaign.findUnique({
-    where: { id: Number(campaignId) },
+    where: { id: campaignId },
     include: {
       template: true,
       list: {
         include: {
           memberships: { include: { contact: true } }
         }
-      }
+      },
+      owner: true
     }
   });
 
   if (!campaign) return { ok: false, reason: 'not_found' };
 
-  if (!['draft', 'scheduled', 'paused'].includes(campaign.status)) {
-    return { ok: false, reason: 'not_enqueueable' };
+  // Resolve recipients:
+  let contacts = [];
+  if (campaign.list?.name === ALL_LIST_NAME) {
+    contacts = await prisma.contact.findMany({
+      where: { ownerId: campaign.ownerId, isSubscribed: true }
+    });
+  } else {
+    contacts = campaign.list?.memberships
+      ?.map((m) => m.contact)
+      ?.filter((c) => c.isSubscribed) ?? [];
   }
 
-  // Build recipients: subscribed & has phone
-  const contacts = campaign.list.memberships
-    .map(m => m.contact)
-    .filter(c => c?.isSubscribed && c?.phone);
+  // Filter valid phone/E.164 (should already be stored as E.164)
+  contacts = contacts.filter((c) => c.phone && isE164(c.phone));
 
-  // Unique by contactId
-  const seen = new Set();
-  const recipients = [];
-  for (const c of contacts) {
-    if (!seen.has(c.id)) { seen.add(c.id); recipients.push(c); }
-  }
-
-  if (recipients.length === 0) {
+  if (!contacts.length) {
     return { ok: false, reason: 'no_valid_recipients' };
   }
 
+  // Render messages + estimate credits
+  const messages = contacts.map((c) => {
+    const text = renderText(campaign.template.text, c);
+    const parts = smsParts(text.length);
+    return { contactId: c.id, to: c.phone, text, parts };
+  });
+
+  const totalCredits = messages.reduce((acc, m) => acc + m.parts, 0);
+
+  // Debit wallet
+  await debitCredits(campaign.ownerId, totalCredits, 'campaign enqueue', {
+    campaignId: campaign.id
+  });
+
+  // Persist messages and update campaign status
   const now = new Date();
-  const CHUNK = 500;
-
-  const result = await prisma.$transaction(async (tx) => {
-    // 1) Debit credits for N recipients
-    await debit(campaign.ownerId, recipients.length, {
-      reason: `enqueue:campaign:${campaign.id}`,
-      campaignId: campaign.id
-    });
-
-    // 2) Flip campaign -> sending
+  await prisma.$transaction(async (tx) => {
     await tx.campaign.update({
       where: { id: campaign.id },
       data: {
         status: 'sending',
-        startedAt: now,
-        total: recipients.length,
-        scheduledAt: null
+        startedAt: campaign.startedAt ?? now,
+        total: messages.length
       }
     });
 
-    // 3) Create messages and collect their IDs
-    let createdCount = 0;
-    const createdIds = [];
-
-    for (let i = 0; i < recipients.length; i += CHUNK) {
-      const slice = recipients.slice(i, i + CHUNK);
-      for (const contact of slice) {
-        const text = renderText(campaign.template.text, contact);
-        const trackingId = newTrackingId();
-        const msg = await tx.campaignMessage.create({
-          data: {
-            ownerId: campaign.ownerId,
-            campaignId: campaign.id,
-            contactId: contact.id,
-            to: contact.phone,
-            text,
-            trackingId,
-            status: 'queued'
-          },
-          select: { id: true }
-        });
-        createdIds.push(msg.id);
-      }
-      createdCount += slice.length;
+    // Create CampaignMessage rows
+    for (const m of messages) {
+      await tx.campaignMessage.create({
+        data: {
+          ownerId: campaign.ownerId,
+          campaignId: campaign.id,
+          contactId: m.contactId,
+          to: m.to,
+          text: m.text,
+          trackingId: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`,
+          status: 'queued'
+        }
+      });
     }
-
-    return { createdCount, createdIds };
   });
 
-  // 4) Try to queue jobs (best effort)
-  const q = await getQueue();
-  if (q && result.createdIds.length) {
-    try {
-      const jobs = result.createdIds.map((id) => ({
-        name: 'send',
-        data: { messageId: id },
-        opts: { removeOnComplete: 1000, removeOnFail: 5000 }
-      }));
-      await q.addBulk(jobs);
-      return { ok: true, total: recipients.length, enqueued: result.createdCount };
-    } catch (e) {
-      // Queue is down -> leave messages queued, allow retry later
-      console.debug('[Queue] addBulk failed; leaving messages queued:', e?.message);
-      return { ok: true, total: recipients.length, enqueued: 0, queueDisabled: true };
-    }
-  }
-
-  // No queue available (disabled or missing)
-  return { ok: true, total: recipients.length, enqueued: 0, queueDisabled: true };
-}
-
-module.exports = { enqueueCampaign };
+  // Here you would push to your provider queue; we return a simple OK for now.
+  return { ok: true, queued: messages.length, creditsDebited: totalCredits };
+};

@@ -6,8 +6,8 @@ generator client {
 
 datasource db {
   provider  = "postgresql"
-  url       = env("DATABASE_URL") // pooled — runtime queries
-  directUrl = env("DIRECT_DATABASE_URL") // direct — migrations
+  url       = env("DATABASE_URL")         // pooled — runtime queries
+  directUrl = env("DIRECT_DATABASE_URL")  // direct — migrations
 }
 
 /**
@@ -28,12 +28,13 @@ model Bootstrap {
 model User {
   id           Int      @id @default(autoincrement())
   email        String   @unique
+  name         String?
   passwordHash String
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
   // Optional profile
-  senderName String? @db.VarChar(11) // SMS sender (3–11 alphanumeric)
+  senderName String? @db.VarChar(11)   // SMS sender (3–11 alphanumeric)
   company    String? @db.VarChar(160)
 
   // Auth tokens
@@ -70,6 +71,14 @@ model RefreshToken {
  * Contacts & lists
  * =========================
  */
+
+enum Gender {
+  male
+  female
+  other
+  unknown
+}
+
 model Contact {
   id Int @id @default(autoincrement())
 
@@ -82,6 +91,11 @@ model Contact {
   email     String?  @db.VarChar(320)
   firstName String?  @db.VarChar(120)
   lastName  String?  @db.VarChar(120)
+
+  // NEW: segmentation & automations
+  gender   Gender   @default(unknown)
+  birthday DateTime?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
@@ -96,6 +110,10 @@ model Contact {
   @@unique([ownerId, phone]) // unique per owner
   @@index([unsubscribeTokenHash])
   @@index([ownerId])
+  @@index([firstName])
+  @@index([lastName])
+  @@index([gender])
+  @@index([birthday])
 }
 
 model List {
@@ -110,10 +128,15 @@ model List {
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
+  // NEW: system lists (e.g., male/female) auto-managed by backend
+  isSystem Boolean  @default(false)
+  slug     String?  @db.VarChar(40) // e.g., "male", "female" for system lists
+
   memberships ListMembership[]
   campaigns   Campaign[]
 
-  @@unique([ownerId, name]) // unique per owner
+  @@unique([ownerId, name])      // human-created lists unique per owner
+  @@unique([ownerId, slug])      // prevents duplicate system slugs per owner (slug must be set for system lists)
   @@index([ownerId])
 }
 
@@ -170,11 +193,15 @@ model Campaign {
   ownerId Int
   owner   User @relation(name: "CampaignOwner", fields: [ownerId], references: [id], onDelete: Cascade)
 
-  name       String
-  templateId Int
-  template   MessageTemplate @relation(fields: [templateId], references: [id], onDelete: Restrict)
-  listId     Int
-  list       List            @relation(fields: [listId], references: [id], onDelete: Restrict)
+  name         String
+  templateId   Int?                // <- nullable now
+  template     MessageTemplate?    @relation(fields: [templateId], references: [id], onDelete: Restrict)
+
+  listId       Int?                // <- nullable now
+  list         List?               @relation(fields: [listId], references: [id], onDelete: Restrict)
+
+  // New: allow free-typed message (when no template)
+  bodyOverride String?             @db.Text
 
   status      CampaignStatus @default(draft)
   scheduledAt DateTime?
@@ -196,6 +223,7 @@ model Campaign {
   @@index([createdAt])
   @@index([ownerId])
 }
+
 
 /**
  * =========================
@@ -243,7 +271,7 @@ model CampaignMessage {
   @@index([status])
   @@index([providerMessageId])
   @@index([ownerId])
-  @@index([campaignId, status]) // for quick "any queued left?" checks
+  @@index([campaignId, status]) // quick "any queued left?" checks
 }
 
 model Redemption {
@@ -257,11 +285,11 @@ model Redemption {
   ownerId Int
   owner   User @relation(fields: [ownerId], references: [id], onDelete: Cascade)
 
-  // NEW: visit counters for offer/QR page
+  // Visit counters for offer/QR page
   visits        Int       @default(0)
   lastVisitedAt DateTime?
 
-  // keep existing redemption moment (if you confirm a one-time redeem)
+  // Redemption moment (one-time redeem)
   redeemedAt       DateTime @default(now())
   redeemedByUserId Int?
   evidenceJson     Json?
@@ -302,7 +330,7 @@ enum PaymentStatus {
 
 enum CreditTxnType {
   credit // e.g. admin topup, purchase
-  debit // e.g. campaign enqueue
+  debit  // e.g. campaign enqueue
   refund // e.g. immediate provider hard-fail
 }
 
@@ -339,8 +367,8 @@ model CreditTransaction {
 model Package {
   id         Int        @id @default(autoincrement())
   name       String     @unique
-  units      Int // credits included
-  priceCents Int // price in cents (for reference)
+  units      Int        // credits included
+  priceCents Int        // price in cents (for reference)
   active     Boolean    @default(true)
   createdAt  DateTime   @default(now())
   updatedAt  DateTime   @updatedAt
@@ -373,12 +401,18 @@ model Automation {
   title     String
   message   String
   isActive  Boolean  @default(false)
-  trigger   String // e.g. 'birthday', 'welcome', 'winback'
+  trigger   String   // 'birthday' | 'nameday' | ...
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
+
+  // NEW
+  isSystem   Boolean @default(false)
+  systemSlug String? @db.VarChar(40)
 
   owner User @relation("UserAutomations", fields: [ownerId], references: [id], onDelete: Cascade)
 
   @@index([ownerId, isActive])
   @@index([ownerId, trigger])
+  @@unique([ownerId, systemSlug])
 }
+

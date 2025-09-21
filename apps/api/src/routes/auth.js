@@ -16,9 +16,10 @@ const isProd = process.env.NODE_ENV === 'production';
 function setRefreshCookie(res, token, expiresAt) {
   res.cookie(REFRESH_COOKIE, token, {
     httpOnly: true,
-    sameSite: isProd ? 'lax' : 'lax',
-    secure: isProd,                 // secure cookies only over HTTPS in prod
-    expires: expiresAt
+    sameSite: 'lax',     // OK for localhost↔localhost (same-site)
+    secure: isProd,      // false in dev, true in prod
+    path: '/',           // VERY important: set and clear on the same path
+    expires: expiresAt,
   });
 }
 
@@ -121,7 +122,7 @@ router.post(
     try {
       const token = req.cookies?.[REFRESH_COOKIE];
       if (token) await logout(token);
-      res.clearCookie(REFRESH_COOKIE);
+      res.clearCookie(REFRESH_COOKIE, { path: '/' });
       res.json({ ok: true });
     } catch (e) {
       res.status(400).json({ message: e.message });

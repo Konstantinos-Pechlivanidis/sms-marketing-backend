@@ -7,42 +7,125 @@ const { finalizeCampaignIfDone } = require('../services/campaignFinalizer.servic
 
 // Optional scheduler queue (only if you have one)
 let schedulerQueue = null;
-try {
-  schedulerQueue = require('../queues/scheduler.queue');
-} catch (_) {
-  // no scheduler in this setup — safe to ignore
-}
+try { schedulerQueue = require('../queues/scheduler.queue'); } catch (_) {}
 
 const router = express.Router();
 router.use(requireAuth);
 
-/**
- * POST /api/campaigns
- * Create draft (optionally scheduled).
- * Body: { name, templateId, listId, scheduledAt? }
- */
+// ------------------------------------------------------------------
+// Constants/helpers
+// ------------------------------------------------------------------
+const ALL_LIST_NAME = '[ALL_CONTACTS]'; // virtual audience marker
+const ADHOC_PREFIX = 'AdHoc';           // prefix for on-the-fly templates
+
+async function ensureAllContactsList(ownerId) {
+  // We keep a real List row to satisfy FK constraint,
+  // but we won't use memberships for it in enqueue/preview.
+  let lst = await prisma.list.findFirst({
+    where: { ownerId, name: ALL_LIST_NAME },
+    select: { id: true, name: true }
+  });
+  if (!lst) {
+    lst = await prisma.list.create({
+      data: {
+        ownerId,
+        name: ALL_LIST_NAME,
+        description: 'Virtual audience: all subscribed contacts (no memberships needed)'
+      },
+      select: { id: true, name: true }
+    });
+  }
+  return lst;
+}
+
+async function resolveListId(ownerId, listId) {
+  // Accept numeric ID or special tokens
+  if (listId === 'ALL' || listId === 'all' || listId === '*') {
+    const lst = await ensureAllContactsList(ownerId);
+    return lst.id;
+  }
+  const id = Number(listId);
+  if (!id) return null;
+  return id;
+}
+
+async function upsertAdhocTemplate({ ownerId, campaignName, text, existingTemplateId }) {
+  if (!text || !text.trim()) {
+    const err = new Error('text required');
+    err.status = 400;
+    throw err;
+  }
+
+  // If current template is already an AdHoc we own, update it (nice UX when editing)
+  if (existingTemplateId) {
+    const tpl = await prisma.messageTemplate.findFirst({
+      where: { id: existingTemplateId, ownerId }
+    });
+    if (tpl && tpl.name.startsWith(`${ADHOC_PREFIX} - `)) {
+      const updated = await prisma.messageTemplate.update({
+        where: { id: tpl.id },
+        data: { text }
+      });
+      return updated.id;
+    }
+  }
+
+  // Else create a new one
+  const niceName = `${ADHOC_PREFIX} - ${campaignName} - ${new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')}`;
+  const created = await prisma.messageTemplate.create({
+    data: {
+      ownerId,
+      name: niceName,
+      text
+    }
+  });
+  return created.id;
+}
+
+// ------------------------------------------------------------------
+// POST /api/campaigns
+// Body: { name, templateId?, text?, listId | "ALL", scheduledAt? }
+// Rules:
+//  - Require name and audience (listId or "ALL")
+//  - Require either templateId OR text (ad-hoc)
+// ------------------------------------------------------------------
 router.post('/campaigns', async (req, res, next) => {
   try {
-    const { name, templateId, listId, scheduledAt } = req.body || {};
+    let { name, templateId, text, listId, scheduledAt } = req.body || {};
+    name = String(name || '').trim();
 
-    if (!name || !templateId || !listId) {
-      return res.status(400).json({ message: 'name, templateId and listId are required' });
+    if (!name) return res.status(400).json({ message: 'name is required' });
+    if (!templateId && !text) {
+      return res.status(400).json({ message: 'Provide templateId or text' });
     }
 
-    // Verify ownership of template and list
-    const [tpl, lst] = await Promise.all([
-      prisma.messageTemplate.findFirst({ where: { id: Number(templateId), ownerId: req.user.id } }),
-      prisma.list.findFirst({ where: { id: Number(listId), ownerId: req.user.id } })
-    ]);
-    if (!tpl) return res.status(404).json({ message: 'template not found' });
-    if (!lst) return res.status(404).json({ message: 'list not found' });
+    // Resolve audience
+    const resolvedListId = await resolveListId(req.user.id, listId);
+    if (!resolvedListId) return res.status(400).json({ message: 'listId (or "ALL") is required' });
+
+    // Verify list ownership
+    const list = await prisma.list.findFirst({ where: { id: resolvedListId, ownerId: req.user.id } });
+    if (!list) return res.status(404).json({ message: 'list not found' });
+
+    // Resolve template
+    let resolvedTemplateId = Number(templateId) || null;
+    if (resolvedTemplateId) {
+      const tpl = await prisma.messageTemplate.findFirst({ where: { id: resolvedTemplateId, ownerId: req.user.id } });
+      if (!tpl) return res.status(404).json({ message: 'template not found' });
+    } else {
+      resolvedTemplateId = await upsertAdhocTemplate({
+        ownerId: req.user.id,
+        campaignName: name,
+        text
+      });
+    }
 
     const data = {
       ownerId: req.user.id,
       createdById: req.user.id,
-      name: String(name),
-      templateId: tpl.id,
-      listId: lst.id,
+      name,
+      templateId: resolvedTemplateId,
+      listId: resolvedListId,
       status: 'draft'
     };
 
@@ -58,11 +141,9 @@ router.post('/campaigns', async (req, res, next) => {
   }
 });
 
-/**
- * GET /api/campaigns
- * (Simple list — most apps should use /api/v1 routes for filters and stats)
- * Query: page=1, pageSize=20
- */
+// ------------------------------------------------------------------
+// GET /api/campaigns (simple paged list)
+// ------------------------------------------------------------------
 router.get('/campaigns', async (req, res, next) => {
   try {
     const page = Math.max(1, Number(req.query.page || 1));
@@ -86,9 +167,9 @@ router.get('/campaigns', async (req, res, next) => {
   }
 });
 
-/**
- * GET /api/campaigns/:id
- */
+// ------------------------------------------------------------------
+// GET /api/campaigns/:id
+// ------------------------------------------------------------------
 router.get('/campaigns/:id', async (req, res, next) => {
   try {
     const id = Number(req.params.id);
@@ -102,16 +183,16 @@ router.get('/campaigns/:id', async (req, res, next) => {
   }
 });
 
-/**
- * PUT /api/campaigns/:id
- * Body: { name?, templateId?, listId?, scheduledAt? (null to unschedule) }
- * - Validates ownership of new template/list.
- * - Handles (un)scheduling (optional schedulerQueue).
- */
+// ------------------------------------------------------------------
+// PUT /api/campaigns/:id
+// Body: { name?, templateId?, text?, listId? | "ALL", scheduledAt? (null unschedule) }
+//  - If text provided, we upsert ad-hoc template and re-link
+//  - If listId is "ALL", we auto-resolve special list
+// ------------------------------------------------------------------
 router.put('/campaigns/:id', async (req, res, next) => {
   try {
     const id = Number(req.params.id);
-    const { name, templateId, listId, scheduledAt } = req.body || {};
+    let { name, templateId, text, listId, scheduledAt } = req.body || {};
 
     const campaign = await prisma.campaign.findFirst({
       where: { id, ownerId: req.user.id }
@@ -126,29 +207,39 @@ router.put('/campaigns/:id', async (req, res, next) => {
 
     if (typeof name !== 'undefined') data.name = String(name);
 
-    if (typeof templateId !== 'undefined') {
-      const tpl = await prisma.messageTemplate.findFirst({
-        where: { id: Number(templateId), ownerId: req.user.id }
-      });
-      if (!tpl) return res.status(404).json({ message: 'template not found' });
-      data.templateId = tpl.id;
-    }
-
+    // Audience update
     if (typeof listId !== 'undefined') {
-      const lst = await prisma.list.findFirst({
-        where: { id: Number(listId), ownerId: req.user.id }
-      });
+      const resolvedListId = await resolveListId(req.user.id, listId);
+      if (!resolvedListId) return res.status(400).json({ message: 'invalid listId' });
+      const lst = await prisma.list.findFirst({ where: { id: resolvedListId, ownerId: req.user.id } });
       if (!lst) return res.status(404).json({ message: 'list not found' });
-      data.listId = lst.id;
+      data.listId = resolvedListId;
     }
 
+    // Template update path
+    if (typeof text !== 'undefined' && text !== null) {
+      // provided ad-hoc text should override/set a template
+      const newTplId = await upsertAdhocTemplate({
+        ownerId: req.user.id,
+        campaignName: data.name || campaign.name,
+        text,
+        existingTemplateId: campaign.templateId
+      });
+      data.templateId = newTplId;
+    } else if (typeof templateId !== 'undefined') {
+      const newTplId = Number(templateId);
+      if (!newTplId) return res.status(400).json({ message: 'invalid templateId' });
+      const tpl = await prisma.messageTemplate.findFirst({ where: { id: newTplId, ownerId: req.user.id } });
+      if (!tpl) return res.status(404).json({ message: 'template not found' });
+      data.templateId = newTplId;
+    }
+
+    // Scheduling
     if (typeof scheduledAt !== 'undefined') {
       if (scheduledAt) {
         const when = new Date(scheduledAt);
         data.scheduledAt = when;
         data.status = 'scheduled';
-
-        // update scheduled job
         try { await schedulerQueue?.remove(`campaign:schedule:${id}`); } catch(_) {}
         const delay = Math.max(0, when.getTime() - Date.now());
         await schedulerQueue?.add('enqueueCampaign', { campaignId: id }, {
@@ -170,10 +261,9 @@ router.put('/campaigns/:id', async (req, res, next) => {
   }
 });
 
-/**
- * DELETE /api/campaigns/:id
- * Allowed unless currently 'sending'
- */
+// ------------------------------------------------------------------
+// DELETE /api/campaigns/:id
+// ------------------------------------------------------------------
 router.delete('/campaigns/:id', async (req, res, next) => {
   try {
     const id = Number(req.params.id);
@@ -184,7 +274,6 @@ router.delete('/campaigns/:id', async (req, res, next) => {
     if (c.status === 'sending') {
       return res.status(409).json({ message: 'Cannot delete while sending' });
     }
-    // cancel scheduled job if any
     try { await schedulerQueue?.remove(`campaign:schedule:${id}`); } catch(_) {}
     await prisma.campaign.delete({ where: { id } });
     res.json({ ok: true });
@@ -193,10 +282,10 @@ router.delete('/campaigns/:id', async (req, res, next) => {
   }
 });
 
-/**
- * GET /api/campaigns/:id/preview
- * Returns first 10 rendered messages (no enqueue)
- */
+// ------------------------------------------------------------------
+// GET /api/campaigns/:id/preview
+//  - If list is [ALL_CONTACTS], we preview against all subscribed contacts
+// ------------------------------------------------------------------
 router.get('/campaigns/:id/preview', async (req, res, next) => {
   try {
     const id = Number(req.params.id);
@@ -206,9 +295,7 @@ router.get('/campaigns/:id/preview', async (req, res, next) => {
         template: true,
         list: {
           include: {
-            memberships: {
-              include: { contact: true }
-            }
+            memberships: { include: { contact: true } }
           }
         }
       }
@@ -221,11 +308,20 @@ router.get('/campaigns/:id/preview', async (req, res, next) => {
         .replace(/\{\{lastName\}\}/g, contact.lastName || '')
         .replace(/\{\{email\}\}/g, contact.email || '');
 
-    const contacts = campaign.list.memberships
-      .map(m => m.contact)
-      .filter(c => c.isSubscribed);
+    let contacts = [];
+    if (campaign.list?.name === ALL_LIST_NAME) {
+      contacts = await prisma.contact.findMany({
+        where: { ownerId: req.user.id, isSubscribed: true },
+        orderBy: { id: 'desc' },
+        take: 200 // safety cap for preview
+      });
+    } else {
+      contacts = campaign.list.memberships
+        .map((m) => m.contact)
+        .filter((c) => c.isSubscribed);
+    }
 
-    const items = contacts.slice(0, 10).map(c => ({
+    const items = contacts.slice(0, 10).map((c) => ({
       to: c.phone,
       text: render(campaign.template.text, c)
     }));
@@ -236,10 +332,9 @@ router.get('/campaigns/:id/preview', async (req, res, next) => {
   }
 });
 
-/**
- * POST /api/campaigns/:id/enqueue
- * Transitions to 'sending', debits credits, creates messages and queues jobs.
- */
+// ------------------------------------------------------------------
+// POST /api/campaigns/:id/enqueue
+// ------------------------------------------------------------------
 router.post('/campaigns/:id/enqueue', async (req, res, next) => {
   try {
     const id = Number(req.params.id);
@@ -257,7 +352,7 @@ router.post('/campaigns/:id/enqueue', async (req, res, next) => {
     if (result?.ok) return res.json(result);
 
     if (result?.reason === 'no_valid_recipients') {
-      return res.status(400).json({ message: 'no valid recipients in the list' });
+      return res.status(400).json({ message: 'no valid recipients in the audience' });
     }
 
     return res.status(500).json({ message: 'enqueue_failed' });
@@ -267,10 +362,9 @@ router.post('/campaigns/:id/enqueue', async (req, res, next) => {
   }
 });
 
-/**
- * GET /api/campaigns/:id/status
- * Returns queued/sent/delivered/failed and the campaign row.
- */
+// ------------------------------------------------------------------
+// GET /api/campaigns/:id/status
+// ------------------------------------------------------------------
 router.get('/campaigns/:id/status', async (req, res, next) => {
   try {
     const id = Number(req.params.id);
@@ -287,7 +381,6 @@ router.get('/campaigns/:id/status', async (req, res, next) => {
       prisma.campaignMessage.count({ where: { ownerId: req.user.id, campaignId: id, status: 'failed' } }),
     ]);
 
-    // Opportunistic finalize (if worker/DLR already moved everything out of non-terminal)
     await finalizeCampaignIfDone(id);
 
     res.json({ campaign: c, metrics: { queued, sent, delivered, failed } });

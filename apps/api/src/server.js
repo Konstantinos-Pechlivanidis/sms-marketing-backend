@@ -59,7 +59,7 @@ const corsOptions = allowlist.length
       },
       credentials: true,
       methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
-      allowedHeaders: ["Content-Type", "Authorization"],
+      allowedHeaders: ["Content-Type", "Authorization", "Idempotency-Key", "X-Requested-With"],
       optionsSuccessStatus: 204,
     }
   : { origin: true, credentials: true };

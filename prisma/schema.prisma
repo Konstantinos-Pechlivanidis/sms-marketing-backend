@@ -376,20 +376,23 @@ model Package {
 }
 
 model Purchase {
-  id         Int           @id @default(autoincrement())
-  ownerId    Int
-  owner      User          @relation(fields: [ownerId], references: [id], onDelete: Cascade)
-  packageId  Int
-  package    Package       @relation(fields: [packageId], references: [id], onDelete: Restrict)
-  units      Int
-  priceCents Int
-  status     PaymentStatus @default(paid) // MVP: treat as paid
-  createdAt  DateTime      @default(now())
+  id                      Int            @id @default(autoincrement())
+  ownerId                 Int
+  packageId               Int
+  units                   Int
+  priceCents              Int
+  status                  PaymentStatus  @default(pending)
 
-  @@index([ownerId])
-  @@index([packageId])
+  // New (optional but recommended)
+  stripeSessionId         String?        @unique
+  stripePaymentIntentId   String?        @unique
+
+  createdAt               DateTime       @default(now())
+  updatedAt               DateTime       @updatedAt
+
+  owner                   User           @relation(fields: [ownerId], references: [id])
+  package                 Package        @relation(fields: [packageId], references: [id])
 }
-
 /**
  * =========================
  * Automations MVP

@@ -1,0 +1,360 @@
+name: Documentation Quality Check
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'docs/**'
+      - 'apps/api/src/routes/**'
+      - 'apps/api/src/middleware/**'
+      - 'apps/api/src/lib/**'
+      - 'prisma/schema.prisma'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'docs/**'
+      - 'apps/api/src/routes/**'
+      - 'apps/api/src/middleware/**'
+      - 'apps/api/src/lib/**'
+      - 'prisma/schema.prisma'
+
+jobs:
+  docs-lint:
+    name: Lint Documentation
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: 'apps/api/package-lock.json'
+
+      - name: Install dependencies
+        working-directory: apps/api
+        run: npm ci
+
+      - name: Lint OpenAPI specification
+        working-directory: apps/api
+        run: npm run docs:lint
+
+      - name: Check for OpenAPI specification completeness
+        run: |
+          echo "Checking OpenAPI specification completeness..."
+          if [ ! -f "docs/openapi/openapi.yaml" ]; then
+            echo "❌ OpenAPI specification not found"
+            exit 1
+          fi
+          
+          # Check if spec has required sections
+          if ! grep -q "openapi:" docs/openapi/openapi.yaml; then
+            echo "❌ Invalid OpenAPI specification format"
+            exit 1
+          fi
+          
+          if ! grep -q "info:" docs/openapi/openapi.yaml; then
+            echo "❌ Missing info section"
+            exit 1
+          fi
+          
+          if ! grep -q "paths:" docs/openapi/openapi.yaml; then
+            echo "❌ Missing paths section"
+            exit 1
+          fi
+          
+          if ! grep -q "components:" docs/openapi/openapi.yaml; then
+            echo "❌ Missing components section"
+            exit 1
+          fi
+          
+          echo "✅ OpenAPI specification is valid"
+
+  docs-build:
+    name: Build Documentation
+    runs-on: ubuntu-latest
+    needs: docs-lint
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: 'apps/api/package-lock.json'
+
+      - name: Install dependencies
+        working-directory: apps/api
+        run: npm ci
+
+      - name: Generate TypeScript types
+        working-directory: apps/api
+        run: npm run openapi:types
+
+      - name: Build documentation site
+        working-directory: apps/api
+        run: npm run docs:build
+
+      - name: Check documentation artifacts
+        run: |
+          echo "Checking documentation artifacts..."
+          
+          # Check if TypeScript types were generated
+          if [ ! -f "docs/generated/openapi-types/openapi-types.d.ts" ]; then
+            echo "❌ TypeScript types not generated"
+            exit 1
+          fi
+          
+          # Check if documentation site was built
+          if [ ! -d "docs/site" ]; then
+            echo "❌ Documentation site not built"
+            exit 1
+          fi
+          
+          # Check if site has index.html
+          if [ ! -f "docs/site/index.html" ]; then
+            echo "❌ Documentation site missing index.html"
+            exit 1
+          fi
+          
+          echo "✅ Documentation artifacts generated successfully"
+
+      - name: Upload documentation artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: documentation-site
+          path: docs/site/
+          retention-days: 30
+
+  postman-validation:
+    name: Validate Postman Collection
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install Newman (Postman CLI)
+        run: npm install -g newman
+
+      - name: Validate Postman collection
+        run: |
+          echo "Validating Postman collection..."
+          if [ ! -f "docs/postman/collection.json" ]; then
+            echo "❌ Postman collection not found"
+            exit 1
+          fi
+          
+          # Basic JSON validation
+          if ! jq empty docs/postman/collection.json 2>/dev/null; then
+            echo "❌ Postman collection is not valid JSON"
+            exit 1
+          fi
+          
+          # Check required fields
+          if ! jq -e '.info' docs/postman/collection.json >/dev/null; then
+            echo "❌ Postman collection missing info section"
+            exit 1
+          fi
+          
+          if ! jq -e '.item' docs/postman/collection.json >/dev/null; then
+            echo "❌ Postman collection missing item section"
+            exit 1
+          fi
+          
+          echo "✅ Postman collection is valid"
+
+      - name: Upload Postman collection
+        uses: actions/upload-artifact@v4
+        with:
+          name: postman-collection
+          path: docs/postman/collection.json
+          retention-days: 30
+
+  sdk-validation:
+    name: Validate TypeScript SDK
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install TypeScript
+        run: npm install -g typescript
+
+      - name: Validate TypeScript SDK
+        run: |
+          echo "Validating TypeScript SDK..."
+          if [ ! -f "docs/generated/sdk/ts/sms-marketing-api.ts" ]; then
+            echo "❌ TypeScript SDK not found"
+            exit 1
+          fi
+          
+          # Check TypeScript compilation
+          if ! tsc --noEmit docs/generated/sdk/ts/sms-marketing-api.ts; then
+            echo "❌ TypeScript SDK has compilation errors"
+            exit 1
+          fi
+          
+          # Check if SDK has required exports
+          if ! grep -q "export class SmsMarketingApiClient" docs/generated/sdk/ts/sms-marketing-api.ts; then
+            echo "❌ TypeScript SDK missing main class"
+            exit 1
+          fi
+          
+          if ! grep -q "export function createSmsMarketingClient" docs/generated/sdk/ts/sms-marketing-api.ts; then
+            echo "❌ TypeScript SDK missing factory function"
+            exit 1
+          fi
+          
+          echo "✅ TypeScript SDK is valid"
+
+      - name: Upload TypeScript SDK
+        uses: actions/upload-artifact@v4
+        with:
+          name: typescript-sdk
+          path: docs/generated/sdk/ts/
+          retention-days: 30
+
+  erd-generation:
+    name: Generate Database ERD
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: 'package-lock.json'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install Prisma
+        run: npm install -g prisma
+
+      - name: Generate database ERD
+        run: npm run prisma:erd
+
+      - name: Check ERD generation
+        run: |
+          echo "Checking ERD generation..."
+          if [ ! -f "docs/erd/diagram.svg" ]; then
+            echo "❌ Database ERD not generated"
+            exit 1
+          fi
+          
+          # Check if SVG is valid
+          if ! grep -q "<svg" docs/erd/diagram.svg; then
+            echo "❌ Generated ERD is not a valid SVG"
+            exit 1
+          fi
+          
+          echo "✅ Database ERD generated successfully"
+
+      - name: Upload ERD
+        uses: actions/upload-artifact@v4
+        with:
+          name: database-erd
+          path: docs/erd/diagram.svg
+          retention-days: 30
+
+  docs-completeness:
+    name: Check Documentation Completeness
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Check documentation completeness
+        run: |
+          echo "Checking documentation completeness..."
+          
+          # Required files
+          required_files=(
+            "docs/openapi/openapi.yaml"
+            "docs/postman/collection.json"
+            "docs/generated/sdk/ts/sms-marketing-api.ts"
+            "docs/generated/sdk/ts/README.md"
+            "docs/README.md"
+          )
+          
+          for file in "${required_files[@]}"; do
+            if [ ! -f "$file" ]; then
+              echo "❌ Missing required file: $file"
+              exit 1
+            fi
+          done
+          
+          # Check if OpenAPI spec has all major endpoints
+          endpoints=(
+            "/api/auth/register"
+            "/api/auth/login"
+            "/api/contacts"
+            "/api/lists"
+            "/api/templates"
+            "/api/campaigns"
+            "/api/billing/balance"
+            "/tracking/redeem"
+          )
+          
+          for endpoint in "${endpoints[@]}"; do
+            if ! grep -q "$endpoint" docs/openapi/openapi.yaml; then
+              echo "❌ Missing endpoint in OpenAPI spec: $endpoint"
+              exit 1
+            fi
+          done
+          
+          echo "✅ Documentation is complete"
+
+  summary:
+    name: Documentation Summary
+    runs-on: ubuntu-latest
+    needs: [docs-lint, docs-build, postman-validation, sdk-validation, erd-generation, docs-completeness]
+    if: always()
+    
+    steps:
+      - name: Documentation Quality Summary
+        run: |
+          echo "## 📚 Documentation Quality Report" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### ✅ Completed Checks:" >> $GITHUB_STEP_SUMMARY
+          echo "- OpenAPI specification linting" >> $GITHUB_STEP_SUMMARY
+          echo "- Documentation site build" >> $GITHUB_STEP_SUMMARY
+          echo "- Postman collection validation" >> $GITHUB_STEP_SUMMARY
+          echo "- TypeScript SDK validation" >> $GITHUB_STEP_SUMMARY
+          echo "- Database ERD generation" >> $GITHUB_STEP_SUMMARY
+          echo "- Documentation completeness check" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 📦 Generated Artifacts:" >> $GITHUB_STEP_SUMMARY
+          echo "- Interactive documentation site" >> $GITHUB_STEP_SUMMARY
+          echo "- TypeScript types and SDK" >> $GITHUB_STEP_SUMMARY
+          echo "- Postman collection" >> $GITHUB_STEP_SUMMARY
+          echo "- Database ERD diagram" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### 🚀 Next Steps:" >> $GITHUB_STEP_SUMMARY
+          echo "1. Review generated documentation" >> $GITHUB_STEP_SUMMARY
+          echo "2. Test API endpoints with Postman collection" >> $GITHUB_STEP_SUMMARY
+          echo "3. Integrate TypeScript SDK in your applications" >> $GITHUB_STEP_SUMMARY
+          echo "4. Deploy documentation site to production" >> $GITHUB_STEP_SUMMARY

@@ -14,3 +14,8 @@ apps/**/.env
 .prisma
 
 /generated/prisma
+
+# Documentation
+docs/site/
+docs/generated/openapi-types/
+docs/erd/diagram.svg

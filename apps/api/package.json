@@ -4,7 +4,13 @@
   "main": "index.js",
   "scripts": {
     "dev": "node --watch src/server.js",
-    "start": "node src/server.js"
+    "start": "node src/server.js",
+    "docs:lint": "redocly lint ../../docs/openapi/openapi.yaml",
+    "docs:build": "redocly build-docs ../../docs/openapi/openapi.yaml -o ../../docs/site",
+    "docs:serve": "npx http-server ../../docs/site -p 8088",
+    "openapi:types": "openapi-typescript ../../docs/openapi/openapi.yaml -o ../../docs/generated/openapi-types/openapi-types.d.ts",
+    "prisma:erd": "prisma generate && node -e \"console.log('ERD generated if generator configured')\"",
+    "docs:generate": "npm run openapi:types && npm run docs:build"
   },
   "keywords": [],
   "author": "",
@@ -27,5 +33,11 @@
     "stripe": "^18.5.0",
     "swagger-ui-express": "^5.0.1",
     "yamljs": "^0.3.0"
+  },
+  "devDependencies": {
+    "@redocly/cli": "^1.0.0",
+    "openapi-typescript": "^7.0.0",
+    "http-server": "^14.1.1",
+    "prisma-erd-generator": "^0.11.0"
   }
 }

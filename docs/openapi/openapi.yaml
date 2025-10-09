@@ -1,0 +1,2912 @@
+openapi: 3.1.0
+info:
+  title: SMS Marketing Backend API
+  version: 1.0.0
+  description: |
+    Comprehensive SMS marketing platform API for campaign management, contact management, 
+    tracking, billing, and automation. Built with Node.js/Express, PostgreSQL, and Redis.
+    
+    ## Authentication
+    - Uses JWT Bearer tokens for API access
+    - Refresh tokens are stored in httpOnly cookies (`rt`)
+    - All authenticated endpoints require `Authorization: Bearer <token>` header
+    
+    ## Rate Limiting
+    - Public endpoints: 60 requests/minute per IP
+    - Authenticated endpoints: 200 requests/minute per IP
+    - Specific endpoints have additional rate limits (login, registration, etc.)
+    
+    ## Environment Variables
+    - `CORS_ALLOWLIST`: Comma-separated list of allowed origins
+    - `REDIS_URL`: Redis connection for rate limiting and caching
+    - `DATABASE_URL`: PostgreSQL connection string
+    - `JWT_SECRET`: Secret for JWT token signing
+    
+  contact:
+    name: Konstantinos Pechlivanidis
+    email: kosta@example.com
+  license:
+    name: ISC
+    url: https://opensource.org/licenses/ISC
+
+servers:
+  - url: http://localhost:3001
+    description: Local development server
+  - url: https://api.smsmarketing.com
+    description: Production server
+    variables:
+      version:
+        default: v1
+        enum: [v1]
+
+tags:
+  - name: Authentication
+    description: User registration, login, logout, and token management
+  - name: User Management
+    description: User profile and account management
+  - name: Contacts
+    description: Contact management and enrollment
+  - name: Lists
+    description: Contact list management and segmentation
+  - name: Templates
+    description: Message template management
+  - name: Campaigns
+    description: SMS campaign creation, management, and execution
+  - name: Campaign Analytics
+    description: Campaign statistics and performance metrics
+  - name: Dashboard
+    description: Dashboard KPIs and analytics
+  - name: Automations
+    description: Automated messaging triggers
+  - name: Tracking
+    description: Message tracking and redemption
+  - name: Billing
+    description: Wallet, credits, and package management
+  - name: Jobs
+    description: Background job management
+  - name: Webhooks
+    description: Webhook endpoints for external integrations
+  - name: Health
+    description: System health and status endpoints
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT access token for authenticated requests
+    cookieAuth:
+      type: apiKey
+      in: cookie
+      name: rt
+      description: HttpOnly refresh token cookie
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid authentication token
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            message: "Missing token"
+    
+    Forbidden:
+      description: Access denied or insufficient permissions
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            message: "Access denied"
+    
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            message: "not found"
+    
+    TooManyRequests:
+      description: Rate limit exceeded
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          headers:
+            Retry-After:
+              description: Seconds to wait before retrying
+              schema:
+                type: integer
+                example: 60
+          example:
+            message: "Too many requests"
+    
+    ValidationError:
+      description: Request validation failed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            message: "email & password required"
+    
+    Conflict:
+      description: Resource conflict (e.g., duplicate email)
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            message: "phone already exists"
+    
+    InsufficientCredits:
+      description: Insufficient wallet credits
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            message: "insufficient credits"
+
+  schemas:
+    # Base schemas
+    ErrorResponse:
+      type: object
+      required: [message]
+      properties:
+        message:
+          type: string
+          description: Error message
+        code:
+          type: string
+          description: Error code (optional)
+        details:
+          type: object
+          description: Additional error details (optional)
+        traceId:
+          type: string
+          description: Request trace ID for debugging
+
+    PaginatedResponse:
+      type: object
+      required: [items, total, page, pageSize]
+      properties:
+        items:
+          type: array
+          items: {}
+          description: Array of items
+        total:
+          type: integer
+          description: Total number of items
+        page:
+          type: integer
+          description: Current page number
+        pageSize:
+          type: integer
+          description: Number of items per page
+
+    # User schemas
+    User:
+      type: object
+      required: [id, email]
+      properties:
+        id:
+          type: integer
+          description: User ID
+        email:
+          type: string
+          format: email
+          description: User email address
+        name:
+          type: string
+          nullable: true
+          description: User's full name
+        senderName:
+          type: string
+          nullable: true
+          maxLength: 11
+          description: SMS sender name (3-11 alphanumeric characters)
+        company:
+          type: string
+          nullable: true
+          maxLength: 160
+          description: Company name
+        createdAt:
+          type: string
+          format: date-time
+          description: Account creation timestamp
+
+    UserWithCredits:
+      allOf:
+        - $ref: '#/components/schemas/User'
+        - type: object
+          properties:
+            credits:
+              type: integer
+              description: Current wallet balance in credits
+
+    UpdateUserRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          nullable: true
+          description: User's full name
+        senderName:
+          type: string
+          nullable: true
+          maxLength: 11
+          description: SMS sender name (3-11 alphanumeric characters)
+        company:
+          type: string
+          nullable: true
+          maxLength: 160
+          description: Company name
+
+    ChangePasswordRequest:
+      type: object
+      required: [oldPassword, newPassword]
+      properties:
+        oldPassword:
+          type: string
+          description: Current password
+        newPassword:
+          type: string
+          minLength: 8
+          description: New password (minimum 8 characters)
+
+    # Auth schemas
+    RegisterRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          description: User email address
+        password:
+          type: string
+          minLength: 8
+          description: Password (minimum 8 characters)
+        senderName:
+          type: string
+          nullable: true
+          maxLength: 11
+          description: SMS sender name (3-11 alphanumeric characters)
+        company:
+          type: string
+          nullable: true
+          maxLength: 160
+          description: Company name
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          description: User email address
+        password:
+          type: string
+          description: User password
+
+    AuthResponse:
+      type: object
+      required: [accessToken, user]
+      properties:
+        accessToken:
+          type: string
+          description: JWT access token
+        user:
+          $ref: '#/components/schemas/User'
+
+    # Contact schemas
+    Gender:
+      type: string
+      enum: [male, female, other, unknown]
+      description: Contact gender
+
+    Contact:
+      type: object
+      required: [id, ownerId, phone, isSubscribed]
+      properties:
+        id:
+          type: integer
+          description: Contact ID
+        ownerId:
+          type: integer
+          description: Owner user ID
+        phone:
+          type: string
+          pattern: '^\+[1-9]\d{1,14}$'
+          description: Phone number in E.164 format
+        email:
+          type: string
+          format: email
+          nullable: true
+          description: Contact email address
+        firstName:
+          type: string
+          nullable: true
+          maxLength: 120
+          description: Contact's first name
+        lastName:
+          type: string
+          nullable: true
+          maxLength: 120
+          description: Contact's last name
+        gender:
+          $ref: '#/components/schemas/Gender'
+        birthday:
+          type: string
+          format: date
+          nullable: true
+          description: Contact's birthday
+        isSubscribed:
+          type: boolean
+          description: Subscription status
+        unsubscribedAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Unsubscription timestamp
+
+    CreateContactRequest:
+      type: object
+      required: [phone]
+      properties:
+        phone:
+          type: string
+          description: Phone number (will be normalized to E.164)
+        email:
+          type: string
+          format: email
+          nullable: true
+          description: Contact email address
+        firstName:
+          type: string
+          nullable: true
+          maxLength: 120
+          description: Contact's first name
+        lastName:
+          type: string
+          nullable: true
+          maxLength: 120
+          description: Contact's last name
+        gender:
+          $ref: '#/components/schemas/Gender'
+        birthday:
+          type: string
+          format: date
+          nullable: true
+          description: Contact's birthday
+
+    UpdateContactRequest:
+      type: object
+      properties:
+        phone:
+          type: string
+          description: Phone number (will be normalized to E.164)
+        email:
+          type: string
+          format: email
+          nullable: true
+          description: Contact email address
+        firstName:
+          type: string
+          nullable: true
+          maxLength: 120
+          description: Contact's first name
+        lastName:
+          type: string
+          nullable: true
+          maxLength: 120
+          description: Contact's last name
+        gender:
+          $ref: '#/components/schemas/Gender'
+        birthday:
+          type: string
+          format: date
+          nullable: true
+          description: Contact's birthday
+        isSubscribed:
+          type: boolean
+          description: Subscription status
+
+    # List schemas
+    List:
+      type: object
+      required: [id, ownerId, name, isSystem]
+      properties:
+        id:
+          type: integer
+          description: List ID
+        ownerId:
+          type: integer
+          description: Owner user ID
+        name:
+          type: string
+          maxLength: 160
+          description: List name
+        description:
+          type: string
+          nullable: true
+          maxLength: 400
+          description: List description
+        isSystem:
+          type: boolean
+          description: Whether this is a system-managed list
+        slug:
+          type: string
+          nullable: true
+          maxLength: 40
+          description: System list slug (for system lists)
+        createdAt:
+          type: string
+          format: date-time
+          description: List creation timestamp
+        updatedAt:
+          type: string
+          format: date-time
+          description: Last update timestamp
+
+    CreateListRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          maxLength: 160
+          description: List name
+        description:
+          type: string
+          nullable: true
+          maxLength: 400
+          description: List description
+
+    # Template schemas
+    MessageTemplate:
+      type: object
+      required: [id, ownerId, name, text]
+      properties:
+        id:
+          type: integer
+          description: Template ID
+        ownerId:
+          type: integer
+          description: Owner user ID
+        name:
+          type: string
+          description: Template name
+        text:
+          type: string
+          description: Template message text
+        createdAt:
+          type: string
+          format: date-time
+          description: Template creation timestamp
+        updatedAt:
+          type: string
+          format: date-time
+          description: Last update timestamp
+
+    CreateTemplateRequest:
+      type: object
+      required: [name, text]
+      properties:
+        name:
+          type: string
+          description: Template name
+        text:
+          type: string
+          description: Template message text
+
+    # Campaign schemas
+    CampaignStatus:
+      type: string
+      enum: [draft, scheduled, sending, paused, completed, failed]
+      description: Campaign status
+
+    Campaign:
+      type: object
+      required: [id, ownerId, name, status, total, sent, failed]
+      properties:
+        id:
+          type: integer
+          description: Campaign ID
+        ownerId:
+          type: integer
+          description: Owner user ID
+        name:
+          type: string
+          description: Campaign name
+        templateId:
+          type: integer
+          nullable: true
+          description: Associated template ID
+        listId:
+          type: integer
+          nullable: true
+          description: Target list ID
+        bodyOverride:
+          type: string
+          nullable: true
+          description: Custom message text (when no template)
+        status:
+          $ref: '#/components/schemas/CampaignStatus'
+        scheduledAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Scheduled send time
+        startedAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Actual start time
+        finishedAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Completion time
+        total:
+          type: integer
+          description: Total recipients
+        sent:
+          type: integer
+          description: Successfully sent messages
+        failed:
+          type: integer
+          description: Failed messages
+        createdById:
+          type: integer
+          description: Creator user ID
+        createdAt:
+          type: string
+          format: date-time
+          description: Campaign creation timestamp
+        updatedAt:
+          type: string
+          format: date-time
+          description: Last update timestamp
+
+    CreateCampaignRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          description: Campaign name
+        templateId:
+          type: integer
+          nullable: true
+          description: Template ID (or provide text)
+        text:
+          type: string
+          nullable: true
+          description: Custom message text (or provide templateId)
+        listId:
+          type: string
+          description: Target list ID or "ALL" for all contacts
+        scheduledAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Schedule send time
+
+    UpdateCampaignRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          description: Campaign name
+        templateId:
+          type: integer
+          nullable: true
+          description: Template ID
+        text:
+          type: string
+          nullable: true
+          description: Custom message text
+        listId:
+          type: string
+          description: Target list ID or "ALL"
+        scheduledAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Schedule send time (null to unschedule)
+
+    CampaignPreview:
+      type: object
+      required: [items, totalRecipients]
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              to:
+                type: string
+                description: Recipient phone number
+              text:
+                type: string
+                description: Rendered message text
+        totalRecipients:
+          type: integer
+          description: Total number of recipients
+
+    CampaignStatusSummary:
+      type: object
+      required: [campaign, metrics]
+      properties:
+        campaign:
+          $ref: '#/components/schemas/Campaign'
+        metrics:
+          type: object
+          properties:
+            queued:
+              type: integer
+              description: Messages in queue
+            sent:
+              type: integer
+              description: Successfully sent
+            delivered:
+              type: integer
+              description: Delivered messages
+            failed:
+              type: integer
+              description: Failed messages
+
+    CampaignStats:
+      type: object
+      required: [campaignId, sent, delivered, failed, redemptions, unsubscribes]
+      properties:
+        campaignId:
+          type: integer
+          description: Campaign ID
+        sent:
+          type: integer
+          description: Total sent messages
+        delivered:
+          type: integer
+          description: Delivered messages
+        failed:
+          type: integer
+          description: Failed messages
+        redemptions:
+          type: integer
+          description: Number of redemptions
+        unsubscribes:
+          type: integer
+          description: Number of unsubscribes
+        deliveredRate:
+          type: number
+          format: float
+          description: Delivery rate (0-1)
+        conversionRate:
+          type: number
+          format: float
+          description: Conversion rate (0-1)
+        firstSentAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: First message sent timestamp
+
+    # Billing schemas
+    WalletBalance:
+      type: object
+      required: [balance]
+      properties:
+        balance:
+          type: integer
+          description: Current wallet balance in credits
+
+    CreditTransactionType:
+      type: string
+      enum: [credit, debit, refund]
+      description: Transaction type
+
+    CreditTransaction:
+      type: object
+      required: [id, ownerId, type, amount, balanceAfter, createdAt]
+      properties:
+        id:
+          type: integer
+          description: Transaction ID
+        ownerId:
+          type: integer
+          description: Owner user ID
+        type:
+          $ref: '#/components/schemas/CreditTransactionType'
+        amount:
+          type: integer
+          description: Transaction amount in credits
+        balanceAfter:
+          type: integer
+          description: Balance after transaction
+        reason:
+          type: string
+          nullable: true
+          maxLength: 200
+          description: Transaction reason
+        campaignId:
+          type: integer
+          nullable: true
+          description: Associated campaign ID
+        messageId:
+          type: integer
+          nullable: true
+          description: Associated message ID
+        meta:
+          type: object
+          nullable: true
+          description: Additional metadata
+        createdAt:
+          type: string
+          format: date-time
+          description: Transaction timestamp
+
+    Package:
+      type: object
+      required: [id, name, units, priceCents, active]
+      properties:
+        id:
+          type: integer
+          description: Package ID
+        name:
+          type: string
+          description: Package name
+        units:
+          type: integer
+          description: Number of credits included
+        priceCents:
+          type: integer
+          description: Price in cents
+        active:
+          type: boolean
+          description: Whether package is available
+        createdAt:
+          type: string
+          format: date-time
+          description: Package creation timestamp
+        updatedAt:
+          type: string
+          format: date-time
+          description: Last update timestamp
+
+    PaymentStatus:
+      type: string
+      enum: [pending, paid, failed, refunded]
+      description: Payment status
+
+    Purchase:
+      type: object
+      required: [id, ownerId, packageId, units, priceCents, status]
+      properties:
+        id:
+          type: integer
+          description: Purchase ID
+        ownerId:
+          type: integer
+          description: Owner user ID
+        packageId:
+          type: integer
+          description: Package ID
+        units:
+          type: integer
+          description: Number of credits purchased
+        priceCents:
+          type: integer
+          description: Price paid in cents
+        status:
+          $ref: '#/components/schemas/PaymentStatus'
+        stripeSessionId:
+          type: string
+          nullable: true
+          description: Stripe session ID
+        stripePaymentIntentId:
+          type: string
+          nullable: true
+          description: Stripe payment intent ID
+        createdAt:
+          type: string
+          format: date-time
+          description: Purchase timestamp
+        updatedAt:
+          type: string
+          format: date-time
+          description: Last update timestamp
+
+    PurchaseRequest:
+      type: object
+      required: [packageId]
+      properties:
+        packageId:
+          type: integer
+          description: Package ID to purchase
+
+    # Dashboard schemas
+    KPI:
+      type: object
+      required: [totalCampaigns, totalMessages, sent, delivered, failed]
+      properties:
+        totalCampaigns:
+          type: integer
+          description: Total number of campaigns
+        totalMessages:
+          type: integer
+          description: Total messages sent
+        sent:
+          type: integer
+          description: Successfully sent messages
+        delivered:
+          type: integer
+          description: Delivered messages
+        failed:
+          type: integer
+          description: Failed messages
+        deliveredRate:
+          type: number
+          format: float
+          description: Overall delivery rate
+        conversion:
+          type: integer
+          description: Total conversions
+        conversionRate:
+          type: number
+          format: float
+          description: Overall conversion rate
+
+    # Automation schemas
+    Automation:
+      type: object
+      required: [id, ownerId, title, message, isActive, trigger]
+      properties:
+        id:
+          type: integer
+          description: Automation ID
+        ownerId:
+          type: integer
+          description: Owner user ID
+        title:
+          type: string
+          description: Automation title
+        message:
+          type: string
+          description: Message to send
+        isActive:
+          type: boolean
+          description: Whether automation is enabled
+        trigger:
+          type: string
+          description: Trigger type (e.g., 'birthday', 'nameday')
+        isSystem:
+          type: boolean
+          description: Whether this is a system automation
+        systemSlug:
+          type: string
+          nullable: true
+          maxLength: 40
+          description: System automation slug
+        createdAt:
+          type: string
+          format: date-time
+          description: Creation timestamp
+        updatedAt:
+          type: string
+          format: date-time
+          description: Last update timestamp
+
+    UpdateAutomationRequest:
+      type: object
+      properties:
+        title:
+          type: string
+          description: Automation title
+        message:
+          type: string
+          description: Message to send
+        trigger:
+          type: string
+          description: Trigger type
+
+    UpdateAutomationStatusRequest:
+      type: object
+      required: [isActive]
+      properties:
+        isActive:
+          type: boolean
+          description: Whether to enable the automation
+
+    # Tracking schemas
+    TrackingCheck:
+      type: object
+      required: [exists, alreadyRedeemed]
+      properties:
+        exists:
+          type: boolean
+          description: Whether tracking ID exists
+        alreadyRedeemed:
+          type: boolean
+          description: Whether already redeemed
+
+    TrackingRedeemRequest:
+      type: object
+      required: [trackingId]
+      properties:
+        trackingId:
+          type: string
+          description: Tracking ID to redeem
+
+    TrackingRedeemResponse:
+      type: object
+      required: [status, trackingId]
+      properties:
+        status:
+          type: string
+          enum: [redeemed, already_redeemed, not_found_or_forbidden]
+          description: Redemption status
+        trackingId:
+          type: string
+          description: Tracking ID
+        messageId:
+          type: integer
+          nullable: true
+          description: Message ID (if redeemed)
+        campaignId:
+          type: integer
+          nullable: true
+          description: Campaign ID (if redeemed)
+        contactId:
+          type: integer
+          nullable: true
+          description: Contact ID (if redeemed)
+        redeemedAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Redemption timestamp
+
+    OfferView:
+      type: object
+      required: [trackingId, storeName, offerText]
+      properties:
+        trackingId:
+          type: string
+          description: Tracking ID
+        storeName:
+          type: string
+          description: Store name
+        offerText:
+          type: string
+          description: Offer text
+
+    # Public enrollment schemas
+    EnrollCodeRequest:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: string
+          description: Enrollment code
+
+    EnrollCodeResponse:
+      type: object
+      required: [ownerId, storeName]
+      properties:
+        ownerId:
+          type: integer
+          description: Store owner ID
+        storeName:
+          type: string
+          description: Store name
+
+    EnrollRequest:
+      type: object
+      required: [code, phone]
+      properties:
+        code:
+          type: string
+          description: Enrollment code
+        phone:
+          type: string
+          description: Phone number
+        email:
+          type: string
+          format: email
+          nullable: true
+          description: Email address
+        firstName:
+          type: string
+          nullable: true
+          description: First name
+        lastName:
+          type: string
+          nullable: true
+          description: Last name
+        gender:
+          $ref: '#/components/schemas/Gender'
+        birthday:
+          type: string
+          format: date
+          nullable: true
+          description: Birthday
+
+    UnsubscribeRequest:
+      type: object
+      required: [token]
+      properties:
+        token:
+          type: string
+          description: Unsubscribe token
+
+    # Job schemas
+    JobHealth:
+      type: object
+      required: [status, queues]
+      properties:
+        status:
+          type: string
+          enum: [healthy, degraded, unhealthy]
+          description: Overall health status
+        queues:
+          type: object
+          properties:
+            sms:
+              type: object
+              properties:
+                waiting:
+                  type: integer
+                  description: Jobs waiting
+                active:
+                  type: integer
+                  description: Jobs being processed
+                completed:
+                  type: integer
+                  description: Completed jobs
+                failed:
+                  type: integer
+                  description: Failed jobs
+            scheduler:
+              type: object
+              properties:
+                waiting:
+                  type: integer
+                  description: Jobs waiting
+                active:
+                  type: integer
+                  description: Jobs being processed
+                completed:
+                  type: integer
+                  description: Completed jobs
+                failed:
+                  type: integer
+                  description: Failed jobs
+
+security:
+  - bearerAuth: []
+
+paths:
+  # Health endpoints
+  /health:
+    get:
+      tags: [Health]
+      summary: Health check
+      description: Returns API health status
+      security: []
+      responses:
+        '200':
+          description: API is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: "ok"
+                  timestamp:
+                    type: string
+                    format: date-time
+                    example: "2024-01-01T00:00:00Z"
+
+  # Authentication endpoints
+  /api/auth/register:
+    post:
+      tags: [Authentication]
+      summary: Register new user
+      description: Create a new user account
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+            examples:
+              basic:
+                summary: Basic registration
+                value:
+                  email: "user@example.com"
+                  password: "password123"
+              with_profile:
+                summary: Registration with profile
+                value:
+                  email: "user@example.com"
+                  password: "password123"
+                  senderName: "MyStore"
+                  company: "My Company Ltd"
+      responses:
+        '201':
+          description: User created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+              example:
+                id: 1
+                email: "user@example.com"
+                senderName: "MyStore"
+                company: "My Company Ltd"
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /api/auth/login:
+    post:
+      tags: [Authentication]
+      summary: Login user
+      description: Authenticate user and get access token
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            examples:
+              login:
+                summary: User login
+                value:
+                  email: "user@example.com"
+                  password: "password123"
+      responses:
+        '200':
+          description: Login successful
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+              description: HttpOnly refresh token cookie (rt)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+              example:
+                accessToken: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
+                user:
+                  id: 1
+                  email: "user@example.com"
+                  senderName: "MyStore"
+                  company: "My Company Ltd"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /api/auth/refresh:
+    post:
+      tags: [Authentication]
+      summary: Refresh access token
+      description: Get new access token using refresh cookie
+      security: []
+      responses:
+        '200':
+          description: Token refreshed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /api/auth/logout:
+    post:
+      tags: [Authentication]
+      summary: Logout user
+      description: Logout and clear refresh token
+      security: []
+      responses:
+        '200':
+          description: Logout successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  # User management endpoints
+  /api/me:
+    get:
+      tags: [User Management]
+      summary: Get current user profile
+      description: Get current user information with wallet balance
+      responses:
+        '200':
+          description: User profile retrieved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserWithCredits'
+              example:
+                id: 1
+                email: "user@example.com"
+                name: "John Doe"
+                senderName: "MyStore"
+                company: "My Company Ltd"
+                credits: 1000
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/user:
+    put:
+      tags: [User Management]
+      summary: Update user profile
+      description: Update user profile information
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateUserRequest'
+            examples:
+              update_profile:
+                summary: Update profile
+                value:
+                  name: "John Doe"
+                  senderName: "MyStore"
+                  company: "My Company Ltd"
+      responses:
+        '200':
+          description: Profile updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/user/password:
+    put:
+      tags: [User Management]
+      summary: Change password
+      description: Change user password
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangePasswordRequest'
+            examples:
+              change_password:
+                summary: Change password
+                value:
+                  oldPassword: "oldpassword123"
+                  newPassword: "newpassword123"
+      responses:
+        '200':
+          description: Password changed successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # Contact management endpoints
+  /api/contacts:
+    get:
+      tags: [Contacts]
+      summary: List contacts
+      description: Get paginated list of contacts with optional filtering
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+            minimum: 1
+          description: Page number
+        - name: pageSize
+          in: query
+          schema:
+            type: integer
+            default: 20
+            minimum: 1
+            maximum: 100
+          description: Items per page
+        - name: q
+          in: query
+          schema:
+            type: string
+          description: Search query (phone, email, name)
+        - name: isSubscribed
+          in: query
+          schema:
+            type: string
+            enum: [true, false]
+          description: Filter by subscription status
+        - name: listId
+          in: query
+          schema:
+            type: integer
+          description: Filter by list membership
+        - name: gender
+          in: query
+          schema:
+            $ref: '#/components/schemas/Gender'
+          description: Filter by gender
+        - name: birthdayFrom
+          in: query
+          schema:
+            type: string
+            format: date
+          description: Filter by birthday from date
+        - name: birthdayTo
+          in: query
+          schema:
+            type: string
+            format: date
+          description: Filter by birthday to date
+        - name: minConversions
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+          description: Filter by minimum conversions
+      responses:
+        '200':
+          description: Contacts retrieved successfully
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PaginatedResponse'
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Contact'
+              example:
+                items:
+                  - id: 1
+                    ownerId: 1
+                    phone: "+1234567890"
+                    email: "john@example.com"
+                    firstName: "John"
+                    lastName: "Doe"
+                    gender: "male"
+                    birthday: "1990-01-01"
+                    isSubscribed: true
+                    unsubscribedAt: null
+                total: 1
+                page: 1
+                pageSize: 20
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      tags: [Contacts]
+      summary: Create contact
+      description: Create a new contact
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateContactRequest'
+            examples:
+              basic_contact:
+                summary: Basic contact
+                value:
+                  phone: "+1234567890"
+                  firstName: "John"
+                  lastName: "Doe"
+                  email: "john@example.com"
+              full_contact:
+                summary: Full contact with all fields
+                value:
+                  phone: "+1234567890"
+                  firstName: "John"
+                  lastName: "Doe"
+                  email: "john@example.com"
+                  gender: "male"
+                  birthday: "1990-01-01"
+      responses:
+        '201':
+          description: Contact created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Contact'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /api/contacts/{id}:
+    get:
+      tags: [Contacts]
+      summary: Get contact by ID
+      description: Retrieve a specific contact
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Contact ID
+      responses:
+        '200':
+          description: Contact retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Contact'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    put:
+      tags: [Contacts]
+      summary: Update contact
+      description: Update contact information
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Contact ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateContactRequest'
+            examples:
+              update_contact:
+                summary: Update contact
+                value:
+                  firstName: "Jane"
+                  lastName: "Smith"
+                  email: "jane@example.com"
+                  isSubscribed: true
+      responses:
+        '200':
+          description: Contact updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Contact'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+    delete:
+      tags: [Contacts]
+      summary: Delete contact
+      description: Delete a contact
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Contact ID
+      responses:
+        '200':
+          description: Contact deleted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  # Public contact enrollment endpoints
+  /api/contacts/enroll-code:
+    post:
+      tags: [Contacts]
+      summary: Generate enrollment code
+      description: Generate QR code for public contact enrollment
+      responses:
+        '200':
+          description: Enrollment code generated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  code:
+                    type: string
+                    description: Base64-encoded enrollment code
+              example:
+                code: "eyJvd25lcklkIjoxLCJ0aW1lc3RhbXAiOjE2MzA0ODAwMDB9"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/contacts/enroll/{code}:
+    get:
+      tags: [Contacts]
+      summary: Resolve enrollment code
+      description: Get store information from enrollment code
+      security: []
+      parameters:
+        - name: code
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Enrollment code
+      responses:
+        '200':
+          description: Store information retrieved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EnrollCodeResponse'
+              example:
+                ownerId: 1
+                storeName: "My Store"
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /api/contacts/enroll:
+    post:
+      tags: [Contacts]
+      summary: Enroll contact
+      description: Public contact enrollment using code
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EnrollRequest'
+            examples:
+              enroll_contact:
+                summary: Enroll contact
+                value:
+                  code: "eyJvd25lcklkIjoxLCJ0aW1lc3RhbXAiOjE2MzA0ODAwMDB9"
+                  phone: "+1234567890"
+                  firstName: "John"
+                  lastName: "Doe"
+                  email: "john@example.com"
+      responses:
+        '200':
+          description: Contact enrolled successfully (updated existing)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Contact'
+        '201':
+          description: Contact created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Contact'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  # Public unsubscribe endpoint
+  /api/contacts/unsubscribe:
+    post:
+      tags: [Contacts]
+      summary: Unsubscribe contact
+      description: Public unsubscribe using token
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UnsubscribeRequest'
+            examples:
+              unsubscribe:
+                summary: Unsubscribe contact
+                value:
+                  token: "abc123def456"
+      responses:
+        '200':
+          description: Unsubscribe successful (idempotent)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  # List management endpoints
+  /api/lists:
+    get:
+      tags: [Lists]
+      summary: List contact lists
+      description: Get paginated list of contact lists
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+            minimum: 1
+          description: Page number
+        - name: pageSize
+          in: query
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 100
+          description: Items per page
+        - name: q
+          in: query
+          schema:
+            type: string
+          description: Search query
+      responses:
+        '200':
+          description: Lists retrieved successfully
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PaginatedResponse'
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/List'
+              example:
+                items:
+                  - id: 1
+                    ownerId: 1
+                    name: "VIP Customers"
+                    description: "High-value customers"
+                    isSystem: false
+                    slug: null
+                total: 1
+                page: 1
+                pageSize: 50
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      tags: [Lists]
+      summary: Create contact list
+      description: Create a new contact list
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateListRequest'
+            examples:
+              create_list:
+                summary: Create list
+                value:
+                  name: "VIP Customers"
+                  description: "High-value customers"
+      responses:
+        '201':
+          description: List created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/List'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/lists/{listId}:
+    get:
+      tags: [Lists]
+      summary: Get list by ID
+      description: Retrieve a specific list
+      parameters:
+        - name: listId
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: List ID
+      responses:
+        '200':
+          description: List retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/List'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/lists/{listId}/contacts:
+    get:
+      tags: [Lists]
+      summary: Get list members
+      description: Get contacts in a list with optional filtering
+      parameters:
+        - name: listId
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: List ID
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+            minimum: 1
+          description: Page number
+        - name: pageSize
+          in: query
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 200
+          description: Items per page
+        - name: isSubscribed
+          in: query
+          schema:
+            type: string
+            enum: [true, false]
+          description: Filter by subscription status
+        - name: minConversions
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+          description: Minimum conversions (for high-conversions list)
+      responses:
+        '200':
+          description: List members retrieved successfully
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PaginatedResponse'
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Contact'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/lists/{listId}/contacts/{contactId}:
+    post:
+      tags: [Lists]
+      summary: Add contact to list
+      description: Add a contact to a list
+      parameters:
+        - name: listId
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: List ID
+        - name: contactId
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Contact ID
+      responses:
+        '201':
+          description: Contact added to list successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: integer
+                  listId:
+                    type: integer
+                  contactId:
+                    type: integer
+                  createdAt:
+                    type: string
+                    format: date-time
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+    delete:
+      tags: [Lists]
+      summary: Remove contact from list
+      description: Remove a contact from a list
+      parameters:
+        - name: listId
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: List ID
+        - name: contactId
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Contact ID
+      responses:
+        '200':
+          description: Contact removed from list successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  # Template management endpoints
+  /api/templates:
+    get:
+      tags: [Templates]
+      summary: List message templates
+      description: Get paginated list of message templates
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+            minimum: 1
+          description: Page number
+        - name: pageSize
+          in: query
+          schema:
+            type: integer
+            default: 20
+            minimum: 1
+            maximum: 100
+          description: Items per page
+        - name: q
+          in: query
+          schema:
+            type: string
+          description: Search query
+      responses:
+        '200':
+          description: Templates retrieved successfully
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PaginatedResponse'
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/MessageTemplate'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      tags: [Templates]
+      summary: Create message template
+      description: Create a new message template
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTemplateRequest'
+            examples:
+              create_template:
+                summary: Create template
+                value:
+                  name: "Welcome Message"
+                  text: "Welcome to our store! Use code WELCOME10 for 10% off your first purchase."
+      responses:
+        '201':
+          description: Template created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageTemplate'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/templates/{id}:
+    get:
+      tags: [Templates]
+      summary: Get template by ID
+      description: Retrieve a specific template
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Template ID
+      responses:
+        '200':
+          description: Template retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageTemplate'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    put:
+      tags: [Templates]
+      summary: Update template
+      description: Update a message template
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Template ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTemplateRequest'
+      responses:
+        '200':
+          description: Template updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MessageTemplate'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      tags: [Templates]
+      summary: Delete template
+      description: Delete a message template
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Template ID
+      responses:
+        '200':
+          description: Template deleted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # Campaign management endpoints
+  /api/campaigns:
+    get:
+      tags: [Campaigns]
+      summary: List campaigns
+      description: Get paginated list of campaigns
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+            minimum: 1
+          description: Page number
+        - name: pageSize
+          in: query
+          schema:
+            type: integer
+            default: 20
+            minimum: 1
+            maximum: 100
+          description: Items per page
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/CampaignStatus'
+          description: Filter by campaign status
+      responses:
+        '200':
+          description: Campaigns retrieved successfully
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PaginatedResponse'
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/Campaign'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      tags: [Campaigns]
+      summary: Create campaign
+      description: Create a new SMS campaign
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateCampaignRequest'
+            examples:
+              with_template:
+                summary: Campaign with template
+                value:
+                  name: "Black Friday Sale"
+                  templateId: 1
+                  listId: "ALL"
+                  scheduledAt: "2024-11-29T09:00:00Z"
+              with_text:
+                summary: Campaign with custom text
+                value:
+                  name: "Flash Sale"
+                  text: "Flash sale! 50% off everything today only! Use code FLASH50"
+                  listId: 1
+      responses:
+        '201':
+          description: Campaign created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Campaign'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '402':
+          $ref: '#/components/responses/InsufficientCredits'
+
+  /api/campaigns/{id}:
+    get:
+      tags: [Campaigns]
+      summary: Get campaign by ID
+      description: Retrieve a specific campaign
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Campaign ID
+      responses:
+        '200':
+          description: Campaign retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Campaign'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    put:
+      tags: [Campaigns]
+      summary: Update campaign
+      description: Update campaign details
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Campaign ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateCampaignRequest'
+            examples:
+              update_campaign:
+                summary: Update campaign
+                value:
+                  name: "Updated Campaign Name"
+                  scheduledAt: "2024-12-01T10:00:00Z"
+      responses:
+        '200':
+          description: Campaign updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Campaign'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+    delete:
+      tags: [Campaigns]
+      summary: Delete campaign
+      description: Delete a campaign (not while sending)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Campaign ID
+      responses:
+        '200':
+          description: Campaign deleted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/campaigns/{id}/preview:
+    get:
+      tags: [Campaigns]
+      summary: Preview campaign
+      description: Preview campaign messages (first 10 recipients)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Campaign ID
+      responses:
+        '200':
+          description: Campaign preview retrieved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CampaignPreview'
+              example:
+                items:
+                  - to: "+1234567890"
+                    text: "Welcome John! Use code WELCOME10 for 10% off."
+                  - to: "+0987654321"
+                    text: "Welcome Jane! Use code WELCOME10 for 10% off."
+                totalRecipients: 150
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/campaigns/{id}/enqueue:
+    post:
+      tags: [Campaigns]
+      summary: Enqueue campaign
+      description: Start sending campaign messages (debits credits)
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Campaign ID
+      responses:
+        '200':
+          description: Campaign enqueued successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+                  campaignId:
+                    type: integer
+                    example: 1
+                  queued:
+                    type: integer
+                    example: 150
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '402':
+          $ref: '#/components/responses/InsufficientCredits'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /api/campaigns/{id}/status:
+    get:
+      tags: [Campaigns]
+      summary: Get campaign status
+      description: Get campaign status and metrics
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Campaign ID
+      responses:
+        '200':
+          description: Campaign status retrieved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CampaignStatusSummary'
+              example:
+                campaign:
+                  id: 1
+                  name: "Black Friday Sale"
+                  status: "sending"
+                  total: 150
+                  sent: 75
+                  failed: 2
+                metrics:
+                  queued: 73
+                  sent: 75
+                  delivered: 70
+                  failed: 2
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # Campaign analytics endpoints
+  /api/v1/campaigns/stats:
+    get:
+      tags: [Campaign Analytics]
+      summary: Get bulk campaign stats
+      description: Get statistics for multiple campaigns
+      parameters:
+        - name: ids
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Comma-separated campaign IDs
+          example: "1,2,3"
+      responses:
+        '200':
+          description: Campaign statistics retrieved
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  campaigns:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CampaignStats'
+              example:
+                campaigns:
+                  - campaignId: 1
+                    sent: 150
+                    delivered: 145
+                    failed: 5
+                    redemptions: 12
+                    unsubscribes: 2
+                    deliveredRate: 0.97
+                    conversionRate: 0.08
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/campaigns/{id}/stats:
+    get:
+      tags: [Campaign Analytics]
+      summary: Get campaign statistics
+      description: Get detailed statistics for a campaign
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Campaign ID
+      responses:
+        '200':
+          description: Campaign statistics retrieved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CampaignStats'
+              example:
+                campaignId: 1
+                sent: 150
+                delivered: 145
+                failed: 5
+                redemptions: 12
+                unsubscribes: 2
+                deliveredRate: 0.97
+                conversionRate: 0.08
+                firstSentAt: "2024-01-01T10:00:00Z"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # Dashboard endpoints
+  /api/dashboard/kpis:
+    get:
+      tags: [Dashboard]
+      summary: Get dashboard KPIs
+      description: Get key performance indicators for dashboard
+      responses:
+        '200':
+          description: KPIs retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/KPI'
+              example:
+                totalCampaigns: 25
+                totalMessages: 5000
+                sent: 4800
+                delivered: 4650
+                failed: 150
+                deliveredRate: 0.97
+                conversion: 120
+                conversionRate: 0.026
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  # Automation endpoints
+  /api/automations:
+    get:
+      tags: [Automations]
+      summary: List automations
+      description: Get list of automations
+      responses:
+        '200':
+          description: Automations retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Automation'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/automations/{id}:
+    put:
+      tags: [Automations]
+      summary: Update automation
+      description: Update automation details
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Automation ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAutomationRequest'
+            examples:
+              update_automation:
+                summary: Update automation
+                value:
+                  title: "Birthday Wishes"
+                  message: "Happy Birthday! Enjoy 20% off today!"
+                  trigger: "birthday"
+      responses:
+        '200':
+          description: Automation updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Automation'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/automations/{id}/status:
+    put:
+      tags: [Automations]
+      summary: Update automation status
+      description: Enable or disable automation
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          description: Automation ID
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateAutomationStatusRequest'
+            examples:
+              enable_automation:
+                summary: Enable automation
+                value:
+                  isActive: true
+              disable_automation:
+                summary: Disable automation
+                value:
+                  isActive: false
+      responses:
+        '200':
+          description: Automation status updated
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  id:
+                    type: integer
+                  isActive:
+                    type: boolean
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # Tracking endpoints
+  /tracking/redeem/{trackingId}:
+    get:
+      tags: [Tracking]
+      summary: Check tracking ID
+      description: Public endpoint to check if tracking ID exists and is redeemed
+      security: []
+      parameters:
+        - name: trackingId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Tracking ID
+      responses:
+        '200':
+          description: Tracking status retrieved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrackingCheck'
+              example:
+                exists: true
+                alreadyRedeemed: false
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /tracking/redeem:
+    post:
+      tags: [Tracking]
+      summary: Redeem tracking ID
+      description: Redeem a tracking ID (one-time redemption)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TrackingRedeemRequest'
+            examples:
+              redeem:
+                summary: Redeem tracking ID
+                value:
+                  trackingId: "abc123def456"
+      responses:
+        '200':
+          description: Redemption processed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TrackingRedeemResponse'
+              example:
+                status: "redeemed"
+                trackingId: "abc123def456"
+                messageId: 123
+                campaignId: 1
+                contactId: 456
+                redeemedAt: "2024-01-01T10:00:00Z"
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /api/tracking/offer/{trackingId}:
+    get:
+      tags: [Tracking]
+      summary: Get offer details
+      description: Public endpoint to get offer details and increment visit counter
+      security: []
+      parameters:
+        - name: trackingId
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Tracking ID
+      responses:
+        '200':
+          description: Offer details retrieved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OfferView'
+              example:
+                trackingId: "abc123def456"
+                storeName: "My Store"
+                offerText: "Special offer! Use code SAVE20 for 20% off!"
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  # Billing endpoints
+  /api/billing/balance:
+    get:
+      tags: [Billing]
+      summary: Get wallet balance
+      description: Get current wallet balance in credits
+      responses:
+        '200':
+          description: Balance retrieved successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WalletBalance'
+              example:
+                balance: 1000
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/billing/transactions:
+    get:
+      tags: [Billing]
+      summary: List credit transactions
+      description: Get paginated list of credit transactions
+      parameters:
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+            minimum: 1
+          description: Page number
+        - name: pageSize
+          in: query
+          schema:
+            type: integer
+            default: 10
+            minimum: 1
+            maximum: 100
+          description: Items per page
+      responses:
+        '200':
+          description: Transactions retrieved successfully
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/PaginatedResponse'
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items:
+                          $ref: '#/components/schemas/CreditTransaction'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/billing/packages:
+    get:
+      tags: [Billing]
+      summary: List available packages
+      description: Get list of available credit packages
+      responses:
+        '200':
+          description: Packages retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Package'
+              example:
+                - id: 1
+                  name: "Starter Pack"
+                  units: 100
+                  priceCents: 1000
+                  active: true
+                - id: 2
+                  name: "Business Pack"
+                  units: 500
+                  priceCents: 4500
+                  active: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/billing/purchase:
+    post:
+      tags: [Billing]
+      summary: Purchase credit package
+      description: Purchase a credit package (idempotent)
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+          description: Idempotency key to prevent duplicate purchases
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PurchaseRequest'
+            examples:
+              purchase:
+                summary: Purchase package
+                value:
+                  packageId: 1
+      responses:
+        '201':
+          description: Purchase successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                    example: true
+                  purchase:
+                    $ref: '#/components/schemas/Purchase'
+                  credited:
+                    type: integer
+                    example: 100
+                  balance:
+                    type: integer
+                    example: 1100
+                  txn:
+                    $ref: '#/components/schemas/CreditTransaction'
+        '400':
+          $ref: '#/components/responses/ValidationError'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  # Job management endpoints
+  /api/jobs/health:
+    get:
+      tags: [Jobs]
+      summary: Get job queue health
+      description: Get health status of background job queues
+      responses:
+        '200':
+          description: Job health retrieved
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobHealth'
+              example:
+                status: "healthy"
+                queues:
+                  sms:
+                    waiting: 5
+                    active: 2
+                    completed: 1000
+                    failed: 3
+                  scheduler:
+                    waiting: 1
+                    active: 0
+                    completed: 50
+                    failed: 0
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # Webhook endpoints
+  /webhooks/mitto/dlr:
+    post:
+      tags: [Webhooks]
+      summary: Mitto delivery reports
+      description: Webhook for Mitto SMS delivery reports (HMAC verified)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Mitto delivery report payload
+      responses:
+        '202':
+          description: Webhook processed successfully
+        '400':
+          description: Invalid webhook payload
+        '401':
+          description: Invalid HMAC signature
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+  /webhooks/mitto/inbound:
+    post:
+      tags: [Webhooks]
+      summary: Mitto inbound messages
+      description: Webhook for Mitto inbound SMS messages (STOP detection, HMAC verified)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              description: Mitto inbound message payload
+      responses:
+        '202':
+          description: Webhook processed successfully
+        '400':
+          description: Invalid webhook payload
+        '401':
+          description: Invalid HMAC signature
+        '429':
+          $ref: '#/components/responses/TooManyRequests'
+
+webhooks:
+  campaign_completed:
+    post:
+      tags: [Webhooks]
+      summary: Campaign completed webhook
+      description: Webhook triggered when a campaign completes
+      request:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                campaignId:
+                  type: integer
+                  description: Campaign ID
+                status:
+                  type: string
+                  enum: [completed, failed]
+                  description: Final campaign status
+                totalSent:
+                  type: integer
+                  description: Total messages sent
+                totalDelivered:
+                  type: integer
+                  description: Total messages delivered
+                totalFailed:
+                  type: integer
+                  description: Total messages failed
+                completedAt:
+                  type: string
+                  format: date-time
+                  description: Completion timestamp
+      responses:
+        '200':
+          description: Webhook processed successfully
+        '400':
+          description: Invalid webhook payload

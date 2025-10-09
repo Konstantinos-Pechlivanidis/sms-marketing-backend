@@ -1,0 +1,1096 @@
+{
+  "info": {
+    "name": "SMS Marketing Backend API",
+    "description": "Comprehensive SMS marketing platform API for campaign management, contact management, tracking, billing, and automation.",
+    "version": "1.0.0",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "bearer",
+    "bearer": [
+      {
+        "key": "token",
+        "value": "{{accessToken}}",
+        "type": "string"
+      }
+    ]
+  },
+  "variable": [
+    {
+      "key": "baseUrl",
+      "value": "http://localhost:3001",
+      "type": "string"
+    },
+    {
+      "key": "accessToken",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "userId",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "campaignId",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "contactId",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "listId",
+      "value": "",
+      "type": "string"
+    },
+    {
+      "key": "templateId",
+      "value": "",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Authentication",
+      "item": [
+        {
+          "name": "Register User",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"user@example.com\",\n  \"password\": \"password123\",\n  \"senderName\": \"MyStore\",\n  \"company\": \"My Company Ltd\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/auth/register",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "auth", "register"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Login User",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "    const response = pm.response.json();",
+                  "    pm.collectionVariables.set('accessToken', response.accessToken);",
+                  "    pm.collectionVariables.set('userId', response.user.id);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"email\": \"user@example.com\",\n  \"password\": \"password123\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/auth/login",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "auth", "login"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Refresh Token",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/auth/refresh",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "auth", "refresh"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Logout User",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/auth/logout",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "auth", "logout"]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "User Management",
+      "item": [
+        {
+          "name": "Get Current User",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/me",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "me"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Update User Profile",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"John Doe\",\n  \"senderName\": \"MyStore\",\n  \"company\": \"My Company Ltd\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/user",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "user"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Change Password",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"oldPassword\": \"password123\",\n  \"newPassword\": \"newpassword123\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/user/password",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "user", "password"]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Contacts",
+      "item": [
+        {
+          "name": "List Contacts",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/contacts?page=1&pageSize=20",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "contacts"],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "pageSize",
+                  "value": "20"
+                }
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Create Contact",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 201) {",
+                  "    const response = pm.response.json();",
+                  "    pm.collectionVariables.set('contactId', response.id);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"phone\": \"+1234567890\",\n  \"firstName\": \"John\",\n  \"lastName\": \"Doe\",\n  \"email\": \"john@example.com\",\n  \"gender\": \"male\",\n  \"birthday\": \"1990-01-01\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/contacts",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "contacts"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Get Contact by ID",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/contacts/{{contactId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "contacts", "{{contactId}}"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Update Contact",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"firstName\": \"Jane\",\n  \"lastName\": \"Smith\",\n  \"email\": \"jane@example.com\",\n  \"isSubscribed\": true\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/contacts/{{contactId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "contacts", "{{contactId}}"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Delete Contact",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/contacts/{{contactId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "contacts", "{{contactId}}"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Generate Enrollment Code",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/contacts/enroll-code",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "contacts", "enroll-code"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Resolve Enrollment Code",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/contacts/enroll/{{enrollmentCode}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "contacts", "enroll", "{{enrollmentCode}}"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Enroll Contact (Public)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"code\": \"{{enrollmentCode}}\",\n  \"phone\": \"+1234567890\",\n  \"firstName\": \"John\",\n  \"lastName\": \"Doe\",\n  \"email\": \"john@example.com\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/contacts/enroll",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "contacts", "enroll"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Unsubscribe Contact (Public)",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"token\": \"{{unsubscribeToken}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/contacts/unsubscribe",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "contacts", "unsubscribe"]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Lists",
+      "item": [
+        {
+          "name": "List Contact Lists",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/lists?page=1&pageSize=50",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "lists"],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "pageSize",
+                  "value": "50"
+                }
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Create Contact List",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 201) {",
+                  "    const response = pm.response.json();",
+                  "    pm.collectionVariables.set('listId', response.id);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"VIP Customers\",\n  \"description\": \"High-value customers\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/lists",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "lists"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Get List by ID",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/lists/{{listId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "lists", "{{listId}}"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Get List Members",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/lists/{{listId}}/contacts?page=1&pageSize=50",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "lists", "{{listId}}", "contacts"],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "pageSize",
+                  "value": "50"
+                }
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Add Contact to List",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/lists/{{listId}}/contacts/{{contactId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "lists", "{{listId}}", "contacts", "{{contactId}}"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Remove Contact from List",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/lists/{{listId}}/contacts/{{contactId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "lists", "{{listId}}", "contacts", "{{contactId}}"]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Templates",
+      "item": [
+        {
+          "name": "List Message Templates",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/templates?page=1&pageSize=20",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "templates"],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "pageSize",
+                  "value": "20"
+                }
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Create Message Template",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 201) {",
+                  "    const response = pm.response.json();",
+                  "    pm.collectionVariables.set('templateId', response.id);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Welcome Message\",\n  \"text\": \"Welcome to our store! Use code WELCOME10 for 10% off your first purchase.\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/templates",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "templates"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Get Template by ID",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/templates/{{templateId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "templates", "{{templateId}}"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Update Template",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Updated Welcome Message\",\n  \"text\": \"Welcome to our store! Use code WELCOME20 for 20% off your first purchase.\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/templates/{{templateId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "templates", "{{templateId}}"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Delete Template",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/templates/{{templateId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "templates", "{{templateId}}"]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Campaigns",
+      "item": [
+        {
+          "name": "List Campaigns",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/campaigns?page=1&pageSize=20",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "campaigns"],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "pageSize",
+                  "value": "20"
+                }
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Create Campaign (with Template)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 201) {",
+                  "    const response = pm.response.json();",
+                  "    pm.collectionVariables.set('campaignId', response.id);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Black Friday Sale\",\n  \"templateId\": {{templateId}},\n  \"listId\": \"ALL\",\n  \"scheduledAt\": \"2024-11-29T09:00:00Z\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/campaigns",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "campaigns"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Create Campaign (with Text)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "exec": [
+                  "if (pm.response.code === 201) {",
+                  "    const response = pm.response.json();",
+                  "    pm.collectionVariables.set('campaignId', response.id);",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Flash Sale\",\n  \"text\": \"Flash sale! 50% off everything today only! Use code FLASH50\",\n  \"listId\": {{listId}}\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/campaigns",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "campaigns"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Get Campaign by ID",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/campaigns/{{campaignId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "campaigns", "{{campaignId}}"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Update Campaign",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Updated Campaign Name\",\n  \"scheduledAt\": \"2024-12-01T10:00:00Z\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/campaigns/{{campaignId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "campaigns", "{{campaignId}}"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Delete Campaign",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/campaigns/{{campaignId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "campaigns", "{{campaignId}}"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Preview Campaign",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/campaigns/{{campaignId}}/preview",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "campaigns", "{{campaignId}}", "preview"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Enqueue Campaign",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/campaigns/{{campaignId}}/enqueue",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "campaigns", "{{campaignId}}", "enqueue"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Get Campaign Status",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/campaigns/{{campaignId}}/status",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "campaigns", "{{campaignId}}", "status"]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Campaign Analytics",
+      "item": [
+        {
+          "name": "Get Bulk Campaign Stats",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/campaigns/stats?ids=1,2,3",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "campaigns", "stats"],
+              "query": [
+                {
+                  "key": "ids",
+                  "value": "1,2,3"
+                }
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Get Campaign Statistics",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/campaigns/{{campaignId}}/stats",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "campaigns", "{{campaignId}}", "stats"]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Dashboard",
+      "item": [
+        {
+          "name": "Get Dashboard KPIs",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/dashboard/kpis",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "dashboard", "kpis"]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Automations",
+      "item": [
+        {
+          "name": "List Automations",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/automations",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "automations"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Update Automation",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"title\": \"Birthday Wishes\",\n  \"message\": \"Happy Birthday! Enjoy 20% off today!\",\n  \"trigger\": \"birthday\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/automations/1",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "automations", "1"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Update Automation Status",
+          "request": {
+            "method": "PUT",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"isActive\": true\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/automations/1/status",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "automations", "1", "status"]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Tracking",
+      "item": [
+        {
+          "name": "Check Tracking ID (Public)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/tracking/redeem/{{trackingId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["tracking", "redeem", "{{trackingId}}"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Redeem Tracking ID",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"trackingId\": \"{{trackingId}}\"\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/tracking/redeem",
+              "host": ["{{baseUrl}}"],
+              "path": ["tracking", "redeem"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Get Offer Details (Public)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/tracking/offer/{{trackingId}}",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "tracking", "offer", "{{trackingId}}"]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Billing",
+      "item": [
+        {
+          "name": "Get Wallet Balance",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/billing/balance",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "billing", "balance"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "List Credit Transactions",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/billing/transactions?page=1&pageSize=10",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "billing", "transactions"],
+              "query": [
+                {
+                  "key": "page",
+                  "value": "1"
+                },
+                {
+                  "key": "pageSize",
+                  "value": "10"
+                }
+              ]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "List Available Packages",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/billing/packages",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "billing", "packages"]
+            }
+          },
+          "response": []
+        },
+        {
+          "name": "Purchase Credit Package",
+          "request": {
+            "method": "POST",
+            "header": [
+              {
+                "key": "Content-Type",
+                "value": "application/json"
+              },
+              {
+                "key": "Idempotency-Key",
+                "value": "{{$randomUUID}}"
+              }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"packageId\": 1\n}"
+            },
+            "url": {
+              "raw": "{{baseUrl}}/api/billing/purchase",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "billing", "purchase"]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Jobs",
+      "item": [
+        {
+          "name": "Get Job Queue Health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/jobs/health",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "jobs", "health"]
+            }
+          },
+          "response": []
+        }
+      ]
+    },
+    {
+      "name": "Health",
+      "item": [
+        {
+          "name": "Health Check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/health",
+              "host": ["{{baseUrl}}"],
+              "path": ["health"]
+            }
+          },
+          "response": []
+        }
+      ]
+    }
+  ]
+}
